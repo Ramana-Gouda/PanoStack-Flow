@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FOTO WORKFLOW AUTOMATISERING (v47.1)
+FOTO WORKFLOW AUTOMATISERING (v4.7.1)
 - STABILITEIT: Seriële verwerking per map (voorkomt vervorming/smalle beelden).
 - VEILIGHEID: Gebruikt '.safe_to_delete' marker voor Stap 3.
 - CAMERA: Ondersteunt ARW, CR2, CR3, NEF, RW2 (één merk per sessie aanbevolen).
