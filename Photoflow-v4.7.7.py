@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FOTO WORKFLOW AUTOMATISERING (v47.7)
+FOTO WORKFLOW AUTOMATISERING (v4.7.7)
 - GUI: Informatie-knop toegevoegd in Tab 1.
 - INTEGRATIE: Verzamelen en opruimen in HDR-stap.
 - VEILIGHEID: Marker-controle voor opschonen mappen.
