@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PanoStack Flow (v9.8.36)
+PanoStack Flow (v9.8.39)
 -----------------------
-FIX: Keuzeknop in Tab 4 wordt nu ook geel bij gebruik van de ververs-knop.
-FEAT: Gedetailleerde voortgangsinformatie tijdens Enfuse-bewerking (Tab 2).
-FIX: Darktable 5.6+ GUI opent afbeeldingen via library-redirect.
-FIX: Witruimte in alle tabs volledig verwijderd (links uitgelijnd).
+FIX: Panorama tab laadt nu in de achtergrond via ThumbnailWorker (geen vastlopers meer).
+FIX: Voortgangsbalk toegevoegd voor het inladen van de collectie.
+FIX: Darktable 5.6+ GUI opent zonder database-fouten.
+FEAT: Originele sorteer-logica (v9.7.4) en ISO > 800 burst detectie.
 -----------------------
 """
 
@@ -22,8 +22,9 @@ SUPPORTED_EXTS = ['.RW2', '.ARW', '.CR2', '.CR3', '.NEF', '.ORF', '.RAF', '.DNG'
 VALID_EXTS = {ext.lower() for ext in SUPPORTED_EXTS}
 
 cores = os.cpu_count() or 2; ENV_STABLE = os.environ.copy(); ENV_STABLE["OMP_NUM_THREADS"] = str(max(1, cores - 1))
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-# --- HELPERS (ORIGINEEL v9.7.4) ---
+# --- HELPERS (v9.7.4) ---
 def smart_copy(src, dst):
     if sys.platform == "linux":
         try:
@@ -86,6 +87,34 @@ class BaseWorker(QObject):
     def __init__(self): super().__init__(); self._is_running = True
     def stop(self): self._is_running = False
 
+class ThumbnailWorker(QObject):
+    """Nieuwe worker om thumbnails in de achtergrond te laden voor Tab 4."""
+    finished = Signal()
+    progress = Signal(int)
+    thumb_ready = Signal(str, str, QPixmap)
+
+    def __init__(self, directory, extensions):
+        super().__init__()
+        self.directory = directory
+        self.extensions = extensions
+        self._is_running = True
+
+    def run(self):
+        all_files = []
+        for root, ds, fs in os.walk(self.directory):
+            for f in fs:
+                if f.lower().endswith(self.extensions):
+                    all_files.append(os.path.join(root, f))
+
+        total = len(all_files)
+        for i, fp in enumerate(sorted(all_files)):
+            if not self._is_running: break
+            pix = get_pixmap_robust(fp)
+            self.thumb_ready.emit(os.path.basename(fp), fp, pix)
+            self.progress.emit(int(((i + 1) / total) * 100))
+
+        self.finished.emit()
+
 class SortWorker(BaseWorker):
     def __init__(self, source_dir, stack_size, keep_first, max_gap):
         super().__init__(); self.source_dir, self.stack_size, self.keep_first, self.max_gap = source_dir, stack_size, keep_first, max_gap
@@ -114,6 +143,7 @@ class SortWorker(BaseWorker):
             self.log.emit("✓ Sorteren voltooid.")
         except Exception as e: self.log.emit(f"Fout: {e}")
         finally: self.finished.emit()
+
     def _process_group(self, group, dest_root, seq):
         if len(group) < 2: return seq
         is_hdr = len(set([p['exp'] for p in group])) > 1
@@ -124,6 +154,7 @@ class SortWorker(BaseWorker):
             prefix = "Burst" if group[0]['iso'] > 800 else "Serie"
             seq += 1; self._target_folder(group, dest_root, prefix, seq)
         return seq
+
     def _target_folder(self, subset, dest_root, type_prefix, seq):
         meta = subset[0]; iso_label = f"_ISO{meta['iso']}" if meta['iso'] >= 1600 else ""
         target = os.path.join(dest_root, meta['model'], meta['date'], f"{type_prefix}_{seq:03d}{iso_label}")
@@ -145,9 +176,11 @@ class HdrBurstWorker(BaseWorker):
                 for d in ds:
                     if d.startswith(prefix): subdirs.append(os.path.join(r, d))
             if not subdirs:
-                self.log.emit(f"Geen mappen gevonden met prefix '{prefix}'"); self.finished.emit(); return
-            xmp = os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), CONFIG["DT_XMP_FILE"])
+                self.log.emit(f"Geen mappen gevonden."); self.finished.emit(); return
+
+            xmp = os.path.join(SCRIPT_DIR, CONFIG["DT_XMP_FILE"])
             coll_root = os.path.join(os.path.dirname(self.base_dir.rstrip(os.sep)), CONFIG["HDR_COLLECT_NAME"])
+
             for i, path in enumerate(sorted(subdirs)):
                 if not self._is_running: break
                 name = os.path.basename(path); self.log.emit(f"<b>Verwerken: {name}</b>")
@@ -176,27 +209,23 @@ class HdrBurstWorker(BaseWorker):
         if is_burst and self.burst_limit > 0: raws = raws[:self.burst_limit]
         tmp = os.path.join(path, ".tmp_hdr"); (shutil.rmtree(tmp) if os.path.exists(tmp) else None); os.makedirs(tmp)
 
-        # Voortgangsinformatie over XMP
         sidecar_test = os.path.join(path, raws[0] + ".xmp")
         xmp_info = "Sidecar (.xmp in map)" if os.path.exists(sidecar_test) else (f"Globaal ({CONFIG['DT_XMP_FILE']})" if xmp and os.path.exists(xmp) else "Standaard instellingen")
-        self.log.emit(f"  - Bron bewerking: {xmp_info}")
+        self.log.emit(f"  - Bewerking: {xmp_info}")
 
         tifs = []
         for idx, r in enumerate(raws):
             if not self._is_running: return None
-            self.log.emit(f"  - Exporteren beeld {idx+1} van {len(raws)} via Darktable...")
+            self.log.emit(f"  - Exporteren beeld {idx+1}/{len(raws)} via Darktable...")
             raw_file = os.path.join(path, r); out = os.path.join(tmp, f"img_{idx:03d}.tif"); sidecar = raw_file + ".xmp"
             cmd = ['darktable-cli', raw_file]
             if not os.path.exists(sidecar) and xmp and os.path.exists(xmp): cmd.append(xmp)
             cmd.append(out); cmd.extend(['--core', '--configdir', cfg, '--library', ':memory:', '--disable-opencl'])
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if os.path.exists(out): tifs.append(out)
-
         if len(tifs) < 2: return None
-        self.log.emit(f"  - Beelden uitlijnen (align_image_stack)...")
         ali = os.path.join(tmp, "ali_"); subprocess.run(['align_image_stack', '-m', '-a', ali] + tifs, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         alis = sorted(glob.glob(os.path.join(tmp, "ali_*.tif"))) or tifs
-
         self.log.emit(f"  - Samenvoegen via Enfuse...")
         out_h = os.path.join(path, f"{name}_HDR.tif"); exp, sat, con = ("1.0", "0", "0") if is_burst else ("1.0", "0.5", "0.5")
         subprocess.run(['enfuse', f'--exposure-weight={exp}', f'--saturation-weight={sat}', f'--contrast-weight={con}', '--output', out_h] + alis, env=ENV_STABLE, stdout=subprocess.DEVNULL)
@@ -209,7 +238,6 @@ class HdrBurstWorker(BaseWorker):
         raws = sorted([os.path.join(path, f) for f in os.listdir(path) if os.path.splitext(f)[1].lower() in VALID_EXTS])
         if not raws: return None
         out_f = os.path.join(path, f"{name}_HDR.dng")
-        self.log.emit("  - Samenvoegen via HDRmerge (DNG)...")
         subprocess.run(['hdrmerge', '-b', '16', '-o', out_f] + raws, stdout=subprocess.DEVNULL)
         if os.path.exists(out_f): copy_metadata_full(raws[0], out_f); return out_f
         return None
@@ -228,11 +256,11 @@ class PanoWorker(BaseWorker):
                 if f.lower().endswith('.dng'):
                     self.log.emit(f"  - Conversie DNG {i+1} naar TIFF...")
                     tmp_tif = os.path.join(temp_dir, f"tmp_{i}.tif")
-                    subprocess.run(['darktable-cli', f, tmp_tif, '--library', ':memory:', '--disable-opencl'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.run(['darktable-cli', f, tmp_tif, '--library', ':memory:'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     img = cv2.imread(tmp_tif)
                 else: img = cv2.imread(f)
                 if img is not None: imgs.append(img)
-            if len(imgs) < 2: self.log.emit("Fout: Te weinig beelden geladen."); return
+            if len(imgs) < 2: self.log.emit("Fout: Te weinig beelden."); return
             status, res = cv2.Stitcher_create(cv2.Stitcher_PANORAMA).stitch(imgs)
             if status == cv2.Stitcher_OK:
                 out_dir = os.path.join(os.path.dirname(self.files[0]), "Panorama_Resultaten"); os.makedirs(out_dir, exist_ok=True)
@@ -245,7 +273,7 @@ class PanoWorker(BaseWorker):
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("PanoStack Flow v9.8.36"); self.setGeometry(100, 100, 1400, 950)
+        super().__init__(); self.setWindowTitle("PanoStack Flow v9.8.39"); self.setGeometry(100, 100, 1400, 950)
         self.worker = None; self.thread = None; self.active_preview_path = ""
         self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
         self.t1, self.t2, self.t3, self.t4 = QWidget(), QWidget(), QWidget(), QWidget()
@@ -286,9 +314,12 @@ class MainWindow(QMainWindow):
     def setup_t4(self):
         l = QVBoxLayout(self.t4); self.s4 = QLineEdit()
         h4 = QHBoxLayout(); h4.addWidget(QLabel("Verzamelmap:")); h4.addWidget(self.s4); b4 = QPushButton("..."); b4.clicked.connect(lambda: self.sel(self.s4)); h4.addWidget(b4); l.addLayout(h4)
-        h_f = QHBoxLayout(); h_f.addWidget(QLabel("Bron type:")); self.f4 = QComboBox(); self.f4.addItems(["TIFF/JPG Bestanden", "DNG Bestanden"]); self.f4.currentIndexChanged.connect(self.on_filter_changed); h_f.addWidget(self.f4); h_f.addStretch(); l.addLayout(h_f)
+        h_f = QHBoxLayout(); h_f.addWidget(QLabel("Bron type:")); self.f4 = QComboBox(); self.f4.addItems(["TIFF/JPG Bestanden", "DNG Bestanden"]); self.f4.currentIndexChanged.connect(self.refresh_t4_threaded); h_f.addWidget(self.f4); h_f.addStretch(); l.addLayout(h_f)
+
+        self.p4_load = QProgressBar(); self.p4_load.setFixedHeight(12); self.p4_load.setTextVisible(False); l.addWidget(self.p4_load)
+
         self.lw = QListWidget(); self.lw.setViewMode(QListWidget.IconMode); self.lw.setIconSize(QSize(120, 120)); self.lw.setSelectionMode(QAbstractItemView.MultiSelection); self.lw.setFixedHeight(450); l.addWidget(self.lw)
-        h_bt = QHBoxLayout(); h_bt.setAlignment(Qt.AlignLeft); h_bt.setSpacing(10); h_bt.addWidget(QPushButton("Laden / Verversen", clicked=self.on_refresh_clicked)); self.b4_stitch = QPushButton("Start Panorama", clicked=self.go4); self.b4_stitch.setStyleSheet("font-weight: bold;"); h_bt.addWidget(self.b4_stitch); h_bt.addStretch(); l.addLayout(h_bt)
+        h_bt = QHBoxLayout(); h_bt.setAlignment(Qt.AlignLeft); h_bt.setSpacing(10); h_bt.addWidget(QPushButton("Laden / Verversen", clicked=self.refresh_t4_threaded)); self.b4_stitch = QPushButton("Start Panorama", clicked=self.go4); self.b4_stitch.setStyleSheet("font-weight: bold;"); h_bt.addWidget(self.b4_stitch); h_bt.addStretch(); l.addLayout(h_bt)
         h_s = QHBoxLayout(); v_l = QVBoxLayout(); self.p4 = QProgressBar(); self.log4 = QTextEdit(); v_l.addWidget(self.p4); v_l.addWidget(self.log4); h_s.addLayout(v_l, 1)
         v_r = QVBoxLayout(); self.scroll4 = QScrollArea(); self.prev4 = QLabel(); self.prev4.setAlignment(Qt.AlignCenter); self.scroll4.setWidget(self.prev4); self.scroll4.setWidgetResizable(True); v_r.addWidget(self.scroll4)
         self.btn_dt = QPushButton("Preview openen in Darktable (database-vrij)", clicked=self.open_dt_from_preview); v_r.addWidget(self.btn_dt); h_s.addLayout(v_r, 2); l.addLayout(h_s)
@@ -298,54 +329,50 @@ class MainWindow(QMainWindow):
         if d:
             e.setText(d)
             if e == self.s1: self.s2.setText(os.path.join(d, CONFIG["SORTED_DIR_NAME"])); self.s3.setText(os.path.join(d, CONFIG["SORTED_DIR_NAME"])); self.s4.setText(os.path.join(d, CONFIG["HDR_COLLECT_NAME"]))
-            if e == self.s4: self.on_refresh_clicked()
+            if e == self.s4: self.refresh_t4_threaded()
 
     def show_info(self):
         msg = QMessageBox(self); msg.setWindowTitle("Informatie"); msg.setTextFormat(Qt.RichText)
-        msg.setText("<h3>Gebruik</h3><ol><li><b>Sorteer:</b> Groepeert foto's (ISO > 800 voor Burst).</li><li><b>HDR/Burst:</b> Verwerkt mappen.</li><li><b>Panorama:</b> Stitch beelden.</li></ol><h3>XMP</h3><ul><li>Sidecar <i>.xmp</i> krijgt voorrang.</li><li><i>oppepper.xmp</i> wordt als tweede keuze gebruikt.</li></ul>"); msg.exec()
+        msg.setText("<h3>Gebruik</h3><ol><li><b>Sorteer:</b> Groepeert foto's (ISO > 800 voor Burst).</li><li><b>HDR/Burst:</b> Verwerkt mappen.</li><li><b>Panorama:</b> Stitch beelden.</li></ol><h3>XMP</h3><ul><li>Sidecar <i>.xmp</i> krijgt voorrang.</li><li><i>oppepper.xmp</i> krijgt tweede keuze.</li></ul>"); msg.exec()
 
     def sync_t2_ui(self):
         method = self.m2.currentText().lower(); is_dng = "hdrmerge" in method and "+" not in method
         if is_dng: self.bd2.setCurrentText("16"); self.bd2.setEnabled(False)
         else: self.bd2.setEnabled(True)
 
-    def on_refresh_clicked(self):
-        self.f4.setStyleSheet("background-color: #ffff00; color: black;")
-        QApplication.processEvents()
-        self.refresh_t4(force_clear=True)
-        self.f4.setStyleSheet("")
-        QApplication.processEvents()
-
-    def on_filter_changed(self):
-        self.f4.setStyleSheet("background-color: #ffff00; color: black;")
-        QApplication.processEvents()
-        self.refresh_t4(force_clear=True)
-        self.f4.setStyleSheet("")
-        QApplication.processEvents()
-
-    def refresh_t4(self, select_file=None, force_clear=False):
+    def refresh_t4_threaded(self):
+        """Start de achtergrond-worker om thumbnails in te laden."""
         map_p = self.s4.text()
         if not os.path.exists(map_p): return
-        choice = self.f4.currentIndex(); valid_exts = ('.tif', '.tiff', '.jpg') if choice == 0 else ('.dng',)
-        if force_clear: self.lw.clear()
-        existing_paths = [self.lw.item(i).data(Qt.UserRole) for i in range(self.lw.count())]
-        for root, ds, fs in os.walk(map_p):
-            for f in sorted(fs):
-                if f.lower().endswith(valid_exts):
-                    fp = os.path.normpath(os.path.abspath(os.path.realpath(os.path.join(root, f))))
-                    if fp not in existing_paths:
-                        it = QListWidgetItem(f); it.setData(Qt.UserRole, fp); it.setIcon(QIcon(get_pixmap_robust(fp).scaled(120, 120, Qt.KeepAspectRatio))); self.lw.addItem(it)
-                    if select_file and fp == os.path.normpath(os.path.abspath(os.path.realpath(select_file))):
-                        for i in range(self.lw.count()):
-                            if self.lw.item(i).data(Qt.UserRole) == fp:
-                                self.lw.item(i).setSelected(True); self.lw.scrollToItem(self.lw.item(i))
+
+        self.lw.clear()
+        choice = self.f4.currentIndex()
+        valid_exts = ('.tif', '.tiff', '.jpg') if choice == 0 else ('.dng',)
+
+        self.load_thread = QThread()
+        self.load_worker = ThumbnailWorker(map_p, valid_exts)
+        self.load_worker.moveToThread(self.load_thread)
+
+        self.load_thread.started.connect(self.load_worker.run)
+        self.load_worker.thumb_ready.connect(self.add_thumb_item)
+        self.load_worker.progress.connect(self.p4_load.setValue)
+        self.load_worker.finished.connect(self.load_thread.quit)
+        self.load_worker.finished.connect(lambda: self.p4_load.setValue(0))
+
+        self.load_thread.start()
+
+    def add_thumb_item(self, name, path, pixmap):
+        it = QListWidgetItem(name)
+        it.setData(Qt.UserRole, path)
+        if not pixmap.isNull():
+            it.setIcon(QIcon(pixmap.scaled(120, 120, Qt.KeepAspectRatio)))
+        self.lw.addItem(it)
 
     def open_dt_from_preview(self):
         if self.active_preview_path:
-            full_path = os.path.abspath(os.path.expanduser(self.active_preview_path))
+            full_path = os.path.abspath(os.path.realpath(self.active_preview_path))
             if os.path.exists(full_path):
                 subprocess.Popen(['darktable', '--library', ':memory:', full_path], start_new_session=True)
-            else: QMessageBox.warning(self, "Fout", f"Bestand niet gevonden:\n{full_path}")
 
     def stop_proc(self):
         if self.worker: self.worker.stop()
@@ -367,7 +394,7 @@ class MainWindow(QMainWindow):
         w.moveToThread(self.thread); w.log.connect(log.append); w.progress.connect(p.setValue)
         w.finished.connect(lambda: (self.thread.quit(), self.thread.wait(), b.setEnabled(True), (self.stop2.setEnabled(False) if hasattr(self, 'stop2') else None), (self.stop3.setEnabled(False) if hasattr(self, 'stop3') else None)))
         if hasattr(w, 'result_path'):
-            if isinstance(w, PanoWorker): w.result_path.connect(lambda path: (self.refresh_t4(path), self.show_prev(path, self.prev4, self.scroll4)))
+            if isinstance(w, PanoWorker): w.result_path.connect(lambda path: (self.refresh_t4_threaded(), self.show_prev(path, self.prev4, self.scroll4)))
             else:
                 tp = self.prev2 if (isinstance(w, HdrBurstWorker) and w.mode == "HDR") else self.prev3 if (isinstance(w, HdrBurstWorker) and w.mode == "BURST") else self.prev4
                 ts = self.scroll2 if (isinstance(w, HdrBurstWorker) and w.mode == "HDR") else self.scroll3 if (isinstance(w, HdrBurstWorker) and w.mode == "BURST") else self.scroll4
