@@ -1,71 +1,86 @@
 #!/usr/bin/env python3
 """
-PanoStack Flow (v1.2)
-- VERSION: Updated to v1.2.
-- TRANSLATED: Info button content is fully preserved in English.
-- FIX: Sorting now strictly respects Camera Model + Timestamp + Filename order.
-- FIX: Only the true 1st photo of a sequence remains in the source folder.
-- FEATURE: Panorama tab supports TIFF, DNG, and RAW (Source) correctly.
-- BEHOUDEN: Alle eerdere functionele verbeteringen (stitching, uitlijning, etc.).
+PanoStack (v0.1)
+- FIX: Panorama startknop geblokkeerd tijdens inlezen.
+- FIX: RAW(Serie) filtert nu strikt op 'Serie_' mappen.
+- FIX: Auto-refresh bij selectie Panorama-tab.
+- HERSTEL: Enfuse wegingen (Exp/Sat/Con) in Tab 2.
 """
 
-import sys; import os; import shutil; import subprocess; from datetime import datetime; import glob; import time; import tempfile; import re; import gc
+import sys
+import os
+import shutil
+import subprocess
+import glob
+import json
+import tempfile
+import re
+import gc
+from datetime import datetime
 
-# --- CONFIGURATIE ---
-CONFIG = {
+# --- CONFIGURATIE BEHEER ---
+DEFAULT_CONFIG = {
     "SORTED_DIR_NAME": "geordend_op_reeks",
     "HDR_COLLECT_NAME": "Verzamelde_HDR_bestanden",
     "DT_XMP_FILE": "oppepper.xmp",
+    "LAST_SOURCE_DIR": os.path.expanduser("~"),
+    "MAX_GAP": 1.0
 }
-SUPPORTED_EXTS = ['.RW2', '.ARW', '.CR2', '.CR3', '.NEF', '.ORF', '.RAF', '.DNG', '.tif', '.tiff', '.jpg', '.jpeg']
-VALID_EXTS = {ext.lower() for ext in SUPPORTED_EXTS}
-RAW_EXTS = {'.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf', '.dng'}
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "panostack_config.json")
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+        except: return DEFAULT_CONFIG
+    return DEFAULT_CONFIG
+
+def save_config(config):
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=4)
+    except: pass
+
+CONFIG = load_config()
+VALID_EXTS = {ext.lower() for ext in ['.RW2', '.ARW', '.CR2', '.CR3', '.NEF', '.ORF', '.RAF', '.DNG', '.tif', '.tiff', '.jpg', '.jpeg']}
 
 cores = os.cpu_count() or 2
-ENV_STABLE = os.environ.copy(); ENV_STABLE["OMP_NUM_THREADS"] = str(max(1, cores - 1))
+ENV_STABLE = os.environ.copy()
+ENV_STABLE["OMP_NUM_THREADS"] = str(max(1, cores - 1))
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
-# --- IMPORTS ---
-try:
-    from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QLineEdit, QFileDialog, QProgressBar, QTextEdit, QTabWidget, QComboBox, QMessageBox, QDoubleSpinBox, QListWidget, QAbstractItemView, QListWidgetItem, QScrollArea, QSplitter)
-    from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QSize
-    from PySide6.QtGui import QIcon, QPixmap, QTransform, QImage
-    import cv2
-    import numpy as np
-except ImportError as e:
-    print(f"Fout: {e}"); sys.exit(1)
-
 # --- HELPERS ---
+
 def smart_copy(src, dst):
     try:
-        if sys.platform == "linux":
-            subprocess.run(['cp', '--reflink=auto', src, dst], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return True
-        shutil.copy2(src, dst); return True
-    except: return False
+        subprocess.run(['cp', '--reflink=auto', src, dst], check=True, capture_output=True)
+        return True
+    except:
+        try: shutil.copy2(src, dst); return True
+        except: return False
 
 def reset_and_copy_metadata(src_raw, dst_hdr):
     if not os.path.exists(dst_hdr): return
-    try: subprocess.run(['exiftool', '-overwrite_original', '-tagsFromFile', src_raw, '-all:all', '--Orientation', '-Orientation=1', '-n', dst_hdr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except: pass
+    subprocess.run(['exiftool', '-overwrite_original', '-tagsFromFile', src_raw, '-all:all', '--Orientation', '-Orientation=1', '-n', dst_hdr], capture_output=True)
 
 def copy_metadata_full(src_raw, dst_hdr):
     if not os.path.exists(dst_hdr): return
-    try: subprocess.run(['exiftool', '-overwrite_original', '-tagsFromFile', src_raw, '-all:all', dst_hdr], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except: pass
+    subprocess.run(['exiftool', '-overwrite_original', '-tagsFromFile', src_raw, '-all:all', dst_hdr], capture_output=True)
 
 def get_image_robust(path):
     if not path or not os.path.exists(path): return QImage()
     img = QImage()
     ext = os.path.splitext(path)[1].lower()
-    if ext in RAW_EXTS or ext == ".dng":
+    if ext in ['.dng', '.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf']:
         for tag in ['-PreviewImage', '-JpgFromRaw', '-ThumbnailImage']:
-            try:
-                res = subprocess.run(['exiftool', '-b', tag, path], capture_output=True)
-                if res.stdout and len(res.stdout) > 5000:
-                    img.loadFromData(res.stdout); break
-            except: continue
-    if img.isNull(): img.load(path)
+            res = subprocess.run(['exiftool', '-b', tag, path], capture_output=True)
+            if res.stdout and len(res.stdout) > 5000:
+                img.loadFromData(res.stdout)
+                if not img.isNull(): break
+        if img.isNull(): return QImage()
+    else: img.load(path)
     if img.isNull(): return QImage()
     try:
         out = subprocess.run(['exiftool', '-S3', '-Orientation', '-n', path], capture_output=True, text=True)
@@ -90,361 +105,344 @@ def find_best_xmp(folder_path):
     global_xmp = os.path.join(SCRIPT_DIR, CONFIG["DT_XMP_FILE"])
     return global_xmp if os.path.exists(global_xmp) else None
 
+# --- IMPORTS ---
+try:
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPushButton, QLabel, QLineEdit, QFileDialog, QProgressBar,
+        QTextEdit, QTabWidget, QComboBox, QMessageBox, QDoubleSpinBox,
+        QListWidget, QAbstractItemView, QListWidgetItem, QScrollArea,
+        QSplitter, QSizePolicy
+    )
+    from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QSize
+    from PySide6.QtGui import QIcon, QPixmap, QTransform, QImage
+    import cv2
+    import numpy as np
+except ImportError as e:
+    print(f"Fout: {e}"); sys.exit(1)
+
 # --- WORKERS ---
+
 class BaseWorker(QObject):
     finished, progress, log, result_path = Signal(), Signal(int), Signal(str), Signal(str)
-    def __init__(self): super().__init__(); self._is_running = True
-    def stop(self): self._is_running = False
+    def __init__(self):
+        super().__init__()
+        self._is_running = True; self.active_proc = None
+    def stop(self):
+        self._is_running = False
+        if self.active_proc:
+            try: self.active_proc.terminate(); self.active_proc.wait(timeout=2)
+            except:
+                try: self.active_proc.kill()
+                except: pass
+        self.log.emit("<br><b style='color:red;'>[STOP] Proces afgebroken.</b>")
+    def safe_run(self, cmd, env=None):
+        if not self._is_running: return 1
+        try:
+            self.active_proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            return self.active_proc.wait()
+        except: return 1
 
 class SortWorker(BaseWorker):
     sub_progress = Signal(int)
-    def __init__(self, source_dir, stack_size, max_gap):
-        super().__init__(); self.source_dir = source_dir; self.stack_size, self.max_gap = stack_size, max_gap
+    def __init__(self, source_dir, max_gap):
+        super().__init__(); self.source_dir, self.max_gap = source_dir, max_gap
     @Slot()
     def run(self):
         try:
-            self.log.emit(f"<b>Start scannen:</b> {os.path.basename(self.source_dir)}")
-            all_files = [f for f in os.listdir(self.source_dir) if any(f.lower().endswith(ext) for ext in VALID_EXTS) and not f.lower().endswith('.xmp')]
-            if not all_files: self.log.emit("Geen bestanden gevonden."); self.finished.emit(); return
+            self.log.emit(f"<b>Start sorteren:</b> {self.source_dir}")
+            all_files = sorted([f for f in os.listdir(self.source_dir) if any(f.lower().endswith(ext) for ext in VALID_EXTS) and not f.lower().endswith('.xmp') and f != CONFIG["SORTED_DIR_NAME"]])
+            if not all_files: self.log.emit("Geen bestanden."); self.finished.emit(); return
             photos = []
-            cmd = ['exiftool', '-q', '-f', '-S3', '-T', '-n', '-FileName', '-DateTimeOriginal', '-ExposureTime', '-FNumber', '-Model', '-ISO']
             for i in range(0, len(all_files), 40):
                 if not self._is_running: break
-                batch = all_files[i:i + 40]
-                res = subprocess.run(cmd + batch, capture_output=True, text=True, cwd=self.source_dir)
-                for line in filter(None, res.stdout.splitlines()):
+                batch = all_files[i:i + 40]; batch_paths = [os.path.join(self.source_dir, f) for f in batch]
+                self.result_path.emit(batch_paths[0])
+                res = subprocess.run(['exiftool', '-q', '-f', '-S3', '-T', '-n', '-DateTimeOriginal', '-ExposureTime', '-FNumber', '-Model', '-ISO'] + batch_paths, capture_output=True, text=True)
+                for idx, line in enumerate(res.stdout.strip().splitlines()):
                     p = line.split('\t')
-                    if len(p) < 6: continue
-                    try:
-                        dt = datetime.strptime(p[1].split('.')[0].split('+')[0].strip(), "%Y:%m:%d %H:%M:%S")
-                        photos.append({'name': p[0], 'ts': dt.timestamp(), 'date': dt.strftime('%Y-%m-%d'), 'exp': f"S{p[2]}A{p[3]}", 'model': p[4].strip().replace(' ','_') if p[4] != "-" else "Onbekend", 'iso': int(re.sub(r"\D", "", p[5])) if p[5] != "-" else 0})
-                    except: continue
-                if batch: self.result_path.emit(os.path.join(self.source_dir, batch[-1]))
+                    if len(p) >= 5:
+                        try:
+                            dt = datetime.strptime(p[0].split('.')[0].split('+')[0].strip(), "%Y:%m:%d %H:%M:%S")
+                            photos.append({'name': batch[idx], 'ts': dt.timestamp(), 'date': dt.strftime('%Y-%m-%d'), 'exp': f"S{p[1]}A{p[2]}", 'iso': int(re.sub(r"\D", "", p[4])) if p[4] != "-" else 0, 'model': p[3].strip().replace(' ','_')})
+                        except: continue
                 self.sub_progress.emit(int(((i + len(batch)) / len(all_files)) * 100))
-
-            # CRUCIAL: Sort by Model, then Timestamp, then Filename to ensure sequence order
-            photos.sort(key=lambda x: (x['model'], x['ts'], x['name']))
-
-            dest_root = os.path.join(self.source_dir, CONFIG["SORTED_DIR_NAME"]); os.makedirs(dest_root, exist_ok=True)
-            self.log.emit("<b>Bestanden indelen in reeksen...</b>")
-            curr, seq, total = [], 0, 0
+            photos.sort(key=lambda x: x['ts']); dest_root = os.path.join(self.source_dir, CONFIG["SORTED_DIR_NAME"]); os.makedirs(dest_root, exist_ok=True)
+            curr, seq = [], 0
             for idx, p in enumerate(photos):
                 if not self._is_running: break
-                # Start new group if gap is too large OR camera model changes
-                if not curr or (p['ts'] - curr[-1]['ts'] <= self.max_gap and p['model'] == curr[-1]['model']):
-                    curr.append(p)
-                else:
-                    new_seq = self._process_group(curr, dest_root, seq)
-                    if new_seq > seq: total += 1; seq = new_seq
-                    curr = [p]
+                is_same = curr and (p['exp'] == curr[-1]['exp'] and p['iso'] == curr[-1]['iso'])
+                if not curr or (p['ts'] - curr[-1]['ts'] <= (5.0 if is_same else self.max_gap)): curr.append(p)
+                else: seq = self._process_group(curr, dest_root, seq); curr = [p]
                 self.progress.emit(int(((idx + 1) / len(photos)) * 100))
-            if curr:
-                if self._process_group(curr, dest_root, seq) > seq: total += 1
-                self.progress.emit(100)
-            self.log.emit(f"<br>✓ Sorteren voltooid: {total} groepen aangemaakt.")
-            self.finished.emit()
-        except Exception as e: self.log.emit(f"Fout: {e}"); self.finished.emit()
+            if curr: self._process_group(curr, dest_root, seq)
+            self.log.emit("<br>✓ Sorteerproces voltooid.")
+        except Exception as e: self.log.emit(f"Fout: {e}")
+        finally: self.finished.emit()
 
     def _process_group(self, group, dest_root, seq):
         if len(group) < 2: return seq
-        is_hdr = len(set([p['exp'] for p in group])) > 1
-        type_p = "Reeks" if is_hdr else ("Burst" if group[0]['iso'] > 800 else "Serie")
-        seq += 1; target_folder = f"{type_p}_{seq:03d}"
-        target_path = os.path.join(dest_root, group[0]['model'], group[0]['date'], target_folder)
-        self.log.emit(f"  [Groep] {target_folder}: {len(group)} foto's ({group[0]['model']})")
-        os.makedirs(target_path, exist_ok=True)
-
-        # In a sequence, ONLY the first sorted photo remains in source
-        for idx, f in enumerate(group):
-            src = os.path.join(self.source_dir, f['name'])
-            dst = os.path.join(target_path, f['name'])
-            if smart_copy(src, dst):
-                if idx > 0: # Not the first photo of the sequence
-                    try: os.remove(src)
-                    except: pass
-        self.result_path.emit(os.path.join(target_path, group[0]['name']))
+        exposures = {p['exp'] for p in group}
+        if len(exposures) > 1:
+            type_p = "Reeks"
+        else:
+            duration = group[-1]['ts'] - group[0]['ts']
+            avg_gap = duration / (len(group) - 1)
+            type_p = "Burst" if avg_gap < 1.2 else "Serie"
+        seq += 1
+        target = os.path.join(dest_root, group[0]['model'], group[0]['date'], f"{type_p}_{seq:03d}")
+        os.makedirs(target, exist_ok=True)
+        for f in group:
+            try: shutil.move(os.path.join(self.source_dir, f['name']), os.path.join(target, f['name']))
+            except: pass
         return seq
 
 class HdrBurstWorker(BaseWorker):
     sub_progress = Signal(int)
-    def __init__(self, base_dir, mode, method, bit_depth, crop_percent, burst_limit=0):
-        super().__init__(); self.base_dir, self.mode, self.method, self.bit_depth, self.crop_percent, self.burst_limit = base_dir, mode, method.lower(), bit_depth, crop_percent, burst_limit
+    def __init__(self, base_dir, mode, method, bit_depth, crop_percent, burst_limit=0, weights=(1.0, 0.2, 0.1)):
+        super().__init__(); self.base_dir, self.mode, self.method, self.bit_depth, self.crop_percent, self.burst_limit, self.weights = base_dir, mode, method.lower(), bit_depth, crop_percent, burst_limit, weights
     @Slot()
     def run(self):
         try:
             prefix = "Reeks_" if self.mode == "HDR" else "Burst_"
-            subdirs = [os.path.join(r, d) for r, ds, _ in os.walk(self.base_dir) for d in ds if d.startswith(prefix) or (self.mode == "BURST" and d.startswith("Serie_"))]
-            if not subdirs: self.log.emit("Geen mappen gevonden."); self.finished.emit(); return
+            subdirs = []
+            if os.path.basename(self.base_dir).startswith(prefix): subdirs.append(self.base_dir)
+            for r, ds, _ in os.walk(self.base_dir):
+                for d in ds:
+                    if d.startswith(prefix): subdirs.append(os.path.join(r, d))
+            subdirs = sorted(list(set(subdirs)))
+            if not subdirs: self.log.emit(f"Geen mappen gevonden voor {prefix}."); self.finished.emit(); return
             coll_root = os.path.join(os.path.dirname(self.base_dir.rstrip(os.sep)), CONFIG["HDR_COLLECT_NAME"])
             os.makedirs(os.path.join(coll_root, "DNG"), exist_ok=True); os.makedirs(os.path.join(coll_root, "TIFF"), exist_ok=True)
-            for i, path in enumerate(sorted(subdirs)):
+            for i, path in enumerate(subdirs):
                 if not self._is_running: break
-                name = os.path.basename(path); self.log.emit(f"--- <b>Set {i+1}: {name}</b> ---"); xmp = find_best_xmp(path)
-                self.sub_progress.emit(0)
-                if self.mode == "HDR" and ("hdrmerge" in self.method or "beide" in self.method):
-                    self.log.emit("  [Status] DNG genereren..."); res = self._do_hdrmerge(path, name)
-                    if res: shutil.copy2(res, os.path.join(coll_root, "DNG", os.path.basename(res))); self.result_path.emit(res)
-                if (self.mode == "HDR" and ("enfuse" in self.method or "beide" in self.method)) or self.mode == "BURST":
+                name = os.path.basename(path); self.log.emit(f"<b>Verwerken:</b> {name}"); xmp = find_best_xmp(path)
+                coll_dng, coll_tif = os.path.join(coll_root, "DNG", f"{name}_HDR.dng"), os.path.join(coll_root, "TIFF", f"{name}_HDR.tif")
+                if self.mode == "HDR" and ("hdrmerge" in self.method or "beide" in self.method) and not os.path.exists(coll_dng):
+                    res = self._do_hdrmerge(path, name)
+                    if res: smart_copy(res, coll_dng); self.result_path.emit(coll_dng)
+                if ((self.mode == "HDR" and ("enfuse" in self.method or "beide" in self.method)) or self.mode == "BURST") and not os.path.exists(coll_tif):
                     res = self._do_enfuse(path, name, xmp)
-                    if res: shutil.copy2(res, os.path.join(coll_root, "TIFF", os.path.basename(res))); self.result_path.emit(res)
+                    if res: smart_copy(res, coll_tif); self.result_path.emit(coll_tif)
                 self.progress.emit(int(((i + 1) / len(subdirs)) * 100))
-            self.log.emit("✓ Klaar."); self.finished.emit()
-        except Exception as e: self.log.emit(f"Fout: {e}"); self.finished.emit()
+            self.log.emit("<br>✓ Proces voltooid.")
+        except Exception as e: self.log.emit(f"Fout: {e}")
+        finally: self.finished.emit()
 
     def _do_enfuse(self, path, name, xmp):
         all_f = sorted([f for f in os.listdir(path) if os.path.splitext(f)[1].lower() in VALID_EXTS and "_HDR" not in f])
         files = all_f[:self.burst_limit] if (self.mode == "BURST" and self.burst_limit > 0) else all_f
         if len(files) < 2: return None
-        tmp = os.path.join(path, ".tmp_proc"); os.makedirs(tmp, exist_ok=True); tifs = []
-        self.log.emit(f"  [Status] {len(files)} beelden exporteren...");
-        for idx, f in enumerate(files):
-            if not self._is_running: return None
-            self.sub_progress.emit(int((idx / (len(files) + 1)) * 100))
-            src, out = os.path.join(path, f), os.path.join(tmp, f"img_{idx:03d}.tif")
-            cmd = ['darktable-cli', src, out, '--core', '--library', ':memory:', '--disable-opencl']
-            if xmp: cmd.insert(2, xmp)
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if os.path.exists(out): tifs.append(out)
-        self.sub_progress.emit(90)
-        if len(tifs) < 2: return None
-        self.log.emit("  [Status] Uitlijnen (Smart Sync voor XMP)..."); ali = os.path.join(tmp, "ali_")
-        subprocess.run(['align_image_stack', '-m', '10', '-a', ali, '-c', '20', '-z', '-x', '-y'] + tifs, stdout=subprocess.DEVNULL)
-        alis = sorted(glob.glob(os.path.join(tmp, "ali_*.tif"))) or tifs
-        out_h = os.path.join(path, f"{name}_HDR.tif")
-        subprocess.run(['enfuse', f'--depth={self.bit_depth}', '--output', out_h] + alis, env=ENV_STABLE, stdout=subprocess.DEVNULL)
-        if os.path.exists(out_h):
-            if self.crop_percent > 0: subprocess.run(['mogrify', '-shave', f'{self.crop_percent}%x{self.crop_percent}%', out_h], stdout=subprocess.DEVNULL)
-            reset_and_copy_metadata(os.path.join(path, files[0]), out_h); shutil.rmtree(tmp, ignore_errors=True); self.sub_progress.emit(100); return out_h
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tifs = []
+            for idx, f in enumerate(files):
+                if not self._is_running: return None
+                out = os.path.join(tmp_dir, f"img_{idx:03d}.tif")
+                cmd = ['darktable-cli', os.path.join(path, f), out, '--core', '--library', ':memory:', '--disable-opencl']
+                if xmp: cmd.insert(2, xmp)
+                if self.safe_run(cmd) == 0: tifs.append(out)
+                self.sub_progress.emit(int(((idx + 1) / len(files)) * 80))
+            if len(tifs) < 2: return None
+            ali = os.path.join(tmp_dir, "ali_"); self.safe_run(['align_image_stack', '-m', '10', '-a', ali, '-c', '20', '-z', '-x', '-y'] + tifs)
+            alis = sorted(glob.glob(os.path.join(tmp_dir, "ali_*.tif")))
+            for a in alis: self.safe_run(['mogrify', '-alpha', 'off', '-type', 'truecolor', '+matte', a])
+            out_h = os.path.join(tmp_dir, "result.tif")
+            self.safe_run(['enfuse', f'--depth={self.bit_depth}', f'--exposure-weight={self.weights[0]}', f'--saturation-weight={self.weights[1]}', f'--contrast-weight={self.weights[2]}', '--output', out_h] + alis, env=ENV_STABLE)
+            if os.path.exists(out_h):
+                final = os.path.join(path, f"{name}_HDR.tif")
+                if self.crop_percent > 0: self.safe_run(['mogrify', '-shave', f'{self.crop_percent}%x{self.crop_percent}%', out_h])
+                shutil.copy2(out_h, final); reset_and_copy_metadata(os.path.join(path, files[0]), final); return final
         return None
 
     def _do_hdrmerge(self, path, name):
-        raws = sorted([os.path.join(path, f) for f in os.listdir(path) if os.path.splitext(f)[1].lower() in VALID_EXTS and not f.lower().endswith(('.tif', '.tiff', '.jpg', '.jpeg')) and "_HDR" not in f])
+        raws = sorted([os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(('.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf', '.dng')) and "_HDR" not in f])
         if len(raws) < 2: return None
-        self.sub_progress.emit(20)
-        out = os.path.join(path, f"{name}_HDR.dng"); subprocess.run(['hdrmerge', '-b', '16', '-o', out] + raws, stdout=subprocess.DEVNULL)
-        self.sub_progress.emit(80)
-        if os.path.exists(out): copy_metadata_full(raws[0], out); self.sub_progress.emit(100); return out
+        out = os.path.join(path, f"{name}_HDR.dng")
+        if self.safe_run(['hdrmerge', '-b', '16', '-o', out] + raws) == 0:
+            if os.path.exists(out): copy_metadata_full(raws[0], out); return out
         return None
 
 class PanoWorker(BaseWorker):
     sub_progress = Signal(int)
-    def __init__(self, files, custom_xmp=None): super().__init__(); self.files = files; self.custom_xmp = custom_xmp
+    def __init__(self, files, custom_xmp=None):
+        super().__init__(); self.files, self.custom_xmp = files, custom_xmp
     @Slot()
     def run(self):
-        tmp_dir = tempfile.mkdtemp(); imgs = []
-        try:
-            for i, f in enumerate(self.files):
-                if not self._is_running: break
-                self.log.emit(f"Laden {i+1}/{len(self.files)}: {os.path.basename(f)}")
-                ext = os.path.splitext(f)[1].lower()
-                if ext in RAW_EXTS or ext == ".dng":
-                    t = os.path.join(tmp_dir, f"p_{i}.tif")
-                    xmp = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp(os.path.dirname(f))
-                    cmd = ['darktable-cli', f, t, '--core', '--library', ':memory:', '--disable-opencl']
-                    if xmp: cmd.insert(2, xmp)
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    img = cv2.imread(t, cv2.IMREAD_COLOR)
-                else:
-                    img = cv2.imread(f, cv2.IMREAD_COLOR)
-                if img is not None:
-                    if img.shape[2] == 4: img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-                    imgs.append(img)
-                self.sub_progress.emit(int(((i + 1) / len(self.files)) * 100))
-            if len(imgs) > 1 and self._is_running:
-                self.log.emit("Samenvoegen...")
-                stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
-                stitcher.setPanoConfidenceThresh(0.1)
-                status, res = stitcher.stitch(imgs)
-                if status != cv2.Stitcher_OK:
-                    self.log.emit(f"Panorama mode mislukt (Status {status}), probeer Scan mode...")
-                    stitcher = cv2.Stitcher_create(cv2.Stitcher_SCANS)
-                    stitcher.setPanoConfidenceThresh(0.1)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            imgs = []
+            try:
+                for i, f in enumerate(self.files):
+                    if not self._is_running: break
+                    if f.lower().endswith(('.dng', '.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf')):
+                        t = os.path.join(tmp_dir, f"p_{i}.tif"); xmp = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp(os.path.dirname(f))
+                        cmd = ['darktable-cli', f, t, '--core', '--library', ':memory:', '--disable-opencl']
+                        if xmp: cmd.insert(2, xmp)
+                        self.safe_run(cmd); read_f = t
+                    else: read_f = f
+                    img = cv2.imread(read_f, cv2.IMREAD_UNCHANGED)
+                    if img is not None:
+                        if img.dtype == np.uint16: img = (img / 256).astype(np.uint8)
+                        if img.shape[2] == 4: img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                        imgs.append(img); del img
+                    self.sub_progress.emit(int(((i + 1) / len(self.files)) * 80))
+                if len(imgs) > 1 and self._is_running:
+                    self.log.emit("<b>Samenvoegen...</b>"); stitcher = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
                     status, res = stitcher.stitch(imgs)
-                if status == cv2.Stitcher_OK:
-                    out = os.path.join(os.path.dirname(self.files[0]), f"Pano_{datetime.now().strftime('%H%M%S')}.tif")
-                    cv2.imwrite(out, res); self.log.emit(f"✓ Klaar: {os.path.basename(out)}"); self.result_path.emit(out)
-                else:
-                    self.log.emit(f"Fout: Status {status}. Geen match gevonden.")
-            self.progress.emit(100)
-        finally: shutil.rmtree(tmp_dir, ignore_errors=True); self.finished.emit()
+                    if status != cv2.Stitcher_OK: status, res = cv2.Stitcher_create(cv2.Stitcher_SCANS).stitch(imgs)
+                    if status == cv2.Stitcher_OK:
+                        out = os.path.abspath(os.path.join(os.path.dirname(self.files[0]), f"Pano_{datetime.now().strftime('%H%M%S')}.tif"))
+                        cv2.imwrite(out, res); self.log.emit(f"✓ Klaar: {os.path.basename(out)}"); self.result_path.emit(out)
+                imgs.clear(); self.progress.emit(100)
+            except Exception as e: self.log.emit(f"Fout: {e}")
+            finally: self.finished.emit()
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        super().__init__(); self.setWindowTitle("PanoStack Flow v1.1"); self.resize(1300, 900)
-        self.worker = None; self.thread = None; self.lt = None
+        super().__init__(); self.setWindowTitle("PanoStack v0.1"); self.resize(1300, 900)
+        self.worker, self.thread, self.lt, self.last_pano_result = None, None, None, None
         self.tabs = QTabWidget(); self.setCentralWidget(self.tabs)
         self.t1, self.t2, self.t3, self.t4 = QWidget(), QWidget(), QWidget(), QWidget()
         self.tabs.addTab(self.t1, "1. Sorteer"); self.tabs.addTab(self.t2, "2. HDR"); self.tabs.addTab(self.t3, "3. Burst"); self.tabs.addTab(self.t4, "4. Panorama")
         self.setup_t1(); self.setup_t2(); self.setup_t3(); self.setup_t4()
         self.tabs.currentChanged.connect(self.on_tab_changed)
+        self._sync_paths()
 
-    def on_tab_changed(self, idx):
-        if idx == 3: self.refresh_t4()
-
-    def _make_thin_bar(self):
-        pb = QProgressBar(); pb.setFixedHeight(8); pb.setTextVisible(False); pb.setStyleSheet("QProgressBar { border: 1px solid #bbb; background: #eee; margin: 0; } QProgressBar::chunk { background: #05B8CC; }")
-        return pb
-
-    def setup_t1(self):
-        l = QVBoxLayout(self.t1); self.s1 = QLineEdit(os.path.expanduser("~"))
-        h = QHBoxLayout(); h.addWidget(QLabel("Bron:")); h.addWidget(self.s1); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s1)); h.addWidget(b); btn_i = QPushButton("ⓘ"); btn_i.clicked.connect(self.show_info); btn_i.setFixedWidth(40); h.addWidget(btn_i); l.addLayout(h)
-        hc = QHBoxLayout(); hc.setSpacing(5); hc.addWidget(QLabel("Pauze:")); self.gv = QDoubleSpinBox(); self.gv.setValue(1.0); hc.addWidget(self.gv); hc.addSpacing(20); hc.addWidget(QLabel("Bracket:")); self.sc = QComboBox(); self.sc.addItems(["3","5","7"]); self.sc.setCurrentIndex(1); hc.addWidget(self.sc); hc.addStretch(); l.addLayout(hc)
-        self.b1 = QPushButton("Start Sorteren", clicked=self.go1); l.addWidget(self.b1)
-        v_p1 = QVBoxLayout(); v_p1.setSpacing(0); v_p1.setContentsMargins(0, 0, 0, 0)
-        l_tot1 = QLabel("Totaal:"); l_tot1.setFixedHeight(14); v_p1.addWidget(l_tot1)
-        h_s1 = QHBoxLayout(); h_s1.setSpacing(5); self.p1 = self._make_thin_bar(); h_s1.addWidget(self.p1)
-        self.stop1 = QPushButton("Stop", clicked=self.stop_proc); self.stop1.setFixedWidth(50); self.stop1.setFixedHeight(18); self.stop1.setStyleSheet("font-size: 10px;"); self.stop1.setEnabled(False); h_s1.addWidget(self.stop1); v_p1.addLayout(h_s1); l.addLayout(v_p1)
-        split = QSplitter(Qt.Horizontal); self.log1 = QTextEdit(); self.prev1 = QLabel(); self.prev1.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev1); sc.setWidgetResizable(True); split.addWidget(self.log1); split.addWidget(sc); l.addWidget(split); split.setSizes([300, 900])
-
-    def setup_t2(self):
-        l = QVBoxLayout(self.t2); h_p = QHBoxLayout(); self.s2 = QLineEdit(); h_p.addWidget(QLabel("Map:")); h_p.addWidget(self.s2); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s2)); h_p.addWidget(b); l.addLayout(h_p)
-        ho = QHBoxLayout(); ho.setSpacing(5); self.m2 = QComboBox(); self.m2.addItems(["Enfuse (TIFF)", "HDRmerge (DNG)", "Beide"]); ho.addWidget(self.m2); ho.addSpacing(20); ho.addWidget(QLabel("Bit:")); self.bd2 = QComboBox(); self.bd2.addItems(["8","16"]); self.bd2.setCurrentIndex(0); ho.addWidget(self.bd2); ho.addSpacing(20); ho.addWidget(QLabel("Crop:")); self.cp2 = QDoubleSpinBox(); self.cp2.setValue(1.5); ho.addWidget(self.cp2); ho.addStretch(); l.addLayout(ho)
-        self.b2 = QPushButton("Start HDR", clicked=lambda: self.go_proc("HDR")); l.addWidget(self.b2)
-        v_p = QVBoxLayout(); v_p.setSpacing(0); v_p.setContentsMargins(0, 0, 0, 0)
-        l_tot = QLabel("Totaal:"); l_tot.setFixedHeight(14); v_p.addWidget(l_tot); self.p2 = self._make_thin_bar(); v_p.addWidget(self.p2)
-        l_sub = QLabel("Huidig:"); l_sub.setFixedHeight(14); v_p.addWidget(l_sub);
-        h_s = QHBoxLayout(); h_s.setSpacing(5); self.p2_sub = self._make_thin_bar(); h_s.addWidget(self.p2_sub)
-        self.stop2 = QPushButton("Stop", clicked=self.stop_proc); self.stop2.setFixedWidth(50); self.stop2.setFixedHeight(18); self.stop2.setStyleSheet("font-size: 10px;"); self.stop2.setEnabled(False); h_s.addWidget(self.stop2); v_p.addLayout(h_s); l.addLayout(v_p)
-        split = QSplitter(Qt.Horizontal); self.log2 = QTextEdit(); self.prev2 = QLabel(); self.prev2.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev2); sc.setWidgetResizable(True); split.addWidget(self.log2); split.addWidget(sc); l.addWidget(split); split.setSizes([300, 900])
-
-    def setup_t3(self):
-        l = QVBoxLayout(self.t3); h = QHBoxLayout(); self.s3 = QLineEdit(); h.addWidget(QLabel("Map:")); h.addWidget(self.s3); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s3)); h.addWidget(b); l.addLayout(h)
-        hb = QHBoxLayout(); hb.setSpacing(5); hb.addWidget(QLabel("Limiet:")); self.bl3 = QComboBox(); self.bl3.addItems(["8", "16"]); hb.addWidget(self.bl3); hb.addStretch(); l.addLayout(hb)
-        self.b3 = QPushButton("Start Burst", clicked=lambda: self.go_proc("BURST")); l.addWidget(self.b3)
-        v_p3 = QVBoxLayout(); v_p3.setSpacing(0); v_p3.setContentsMargins(0, 0, 0, 0)
-        l_tot3 = QLabel("Totaal:"); l_tot3.setFixedHeight(14); v_p3.addWidget(l_tot3); self.p3 = self._make_thin_bar(); v_p3.addWidget(self.p3)
-        l_sub3 = QLabel("Huidig:"); l_sub3.setFixedHeight(14); v_p3.addWidget(l_sub3);
-        h_s3 = QHBoxLayout(); h_s3.setSpacing(5); self.p3_sub = self._make_thin_bar(); h_s3.addWidget(self.p3_sub)
-        self.stop3 = QPushButton("Stop", clicked=self.stop_proc); self.stop3.setFixedWidth(50); self.stop3.setFixedHeight(18); self.stop3.setStyleSheet("font-size: 10px;"); self.stop3.setEnabled(False); h_s3.addWidget(self.stop3); v_p3.addLayout(h_s3); l.addLayout(v_p3)
-        split = QSplitter(Qt.Horizontal); self.log3 = QTextEdit(); self.prev3 = QLabel(); self.prev3.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev3); sc.setWidgetResizable(True); split.addWidget(self.log3); split.addWidget(sc); l.addWidget(split); split.setSizes([300, 900])
-
-    def setup_t4(self):
-        main_l = QVBoxLayout(self.t4)
-        top_w = QWidget(); top_l = QVBoxLayout(top_w); top_l.setContentsMargins(0,0,0,0)
-        h1 = QHBoxLayout(); self.s4 = QLineEdit(); h1.addWidget(QLabel("Map:")); h1.addWidget(self.s4); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s4)); h1.addWidget(b); top_l.addLayout(h1)
-        h2 = QHBoxLayout(); h2.addWidget(QLabel("Custom XMP:")); self.x4 = QLineEdit(); h2.addWidget(self.x4); self.bx4 = QPushButton("Kies"); self.bx4.clicked.connect(self.sel_xmp4); h2.addWidget(self.bx4); self.bc4 = QPushButton("Wis"); self.bc4.clicked.connect(lambda: self.x4.clear()); h2.addWidget(self.bc4); top_l.addLayout(h2)
-        h3 = QHBoxLayout(); h3.setSpacing(10); self.f4 = QComboBox(); self.f4.addItems(["TIFF/JPG", "DNG", "RAW (Bronmap)"]); self.f4.currentIndexChanged.connect(self.refresh_t4); h3.addWidget(self.f4)
-        h3.addWidget(QLabel("Grootte:")); self.ts4 = QComboBox(); self.ts4.addItems(["100", "150", "200", "250", "300"]); self.ts4.setCurrentText("200"); self.ts4.currentIndexChanged.connect(self.refresh_t4); h3.addWidget(self.ts4)
-        self.p4_load = self._make_thin_bar(); h3.addWidget(self.p4_load); top_l.addLayout(h3)
-        main_l.addWidget(top_w)
-        self.v_split = QSplitter(Qt.Vertical)
-        self.lw = QListWidget(); self.lw.setViewMode(QListWidget.IconMode); self.lw.setIconSize(QSize(200, 200)); self.lw.setSelectionMode(QAbstractItemView.MultiSelection); self.v_split.addWidget(self.lw)
-        bot_w = QWidget(); bot_l = QVBoxLayout(bot_w); bot_l.setContentsMargins(0,0,0,0)
-        self.b4 = QPushButton("Start Panorama", clicked=self.go4); bot_l.addWidget(self.b4)
-        v_p4 = QVBoxLayout(); v_p4.setSpacing(0); v_p4.setContentsMargins(0, 0, 0, 0)
-        l_sub4 = QLabel("Huidig:"); l_sub4.setFixedHeight(14); v_p4.addWidget(l_sub4)
-        h_s4 = QHBoxLayout(); h_s4.setSpacing(5); self.p4_sub = self._make_thin_bar(); h_s4.addWidget(self.p4_sub)
-        self.stop4 = QPushButton("Stop", clicked=self.stop_proc); self.stop4.setFixedWidth(50); self.stop4.setFixedHeight(18); self.stop4.setStyleSheet("font-size: 10px;"); self.stop4.setEnabled(False); h_s4.addWidget(self.stop4); v_p4.addLayout(h_s4); bot_l.addLayout(v_p4)
-        h_split = QSplitter(Qt.Horizontal); self.log4 = QTextEdit(); h_split.addWidget(self.log4); self.prev4 = QLabel(); self.prev4.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev4); sc.setWidgetResizable(True); h_split.addWidget(sc); bot_l.addWidget(h_split); h_split.setSizes([300, 900]); self.v_split.addWidget(bot_w); main_l.addWidget(self.v_split)
-
-    def sel(self, e):
-        d = QFileDialog.getExistingDirectory(self, "Map", e.text())
-        if d:
-            p = os.path.abspath(d); e.setText(p)
-            if e == self.s1: p_sort = os.path.join(p, CONFIG["SORTED_DIR_NAME"]); self.s2.setText(p_sort); self.s3.setText(p_sort); self.s4.setText(os.path.join(p, CONFIG["HDR_COLLECT_NAME"]))
+    def on_tab_changed(self, index):
+        if index == 3: # Panorama tab
             self.refresh_t4()
 
+    def closeEvent(self, event):
+        if self.worker: self.worker.stop()
+        CONFIG["LAST_SOURCE_DIR"], CONFIG["MAX_GAP"] = self.s1.text(), self.gv.value(); save_config(CONFIG); event.accept()
+
+    def _sync_paths(self):
+        p = self.s1.text().strip()
+        if p and os.path.exists(p):
+            sorted_p = os.path.join(p, CONFIG["SORTED_DIR_NAME"])
+            self.s2.setText(sorted_p); self.s3.setText(sorted_p); self.s4.setText(os.path.join(p, CONFIG["HDR_COLLECT_NAME"]))
+
+    def _make_thin_bar(self):
+        pb = QProgressBar(); pb.setFixedHeight(8); pb.setTextVisible(False); pb.setStyleSheet("QProgressBar { border: 1px solid #bbb; background: #eee; } QProgressBar::chunk { background: #05B8CC; }")
+        pb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); return pb
+
+    def setup_t1(self):
+        l = QVBoxLayout(self.t1); self.s1 = QLineEdit(CONFIG["LAST_SOURCE_DIR"])
+        self.s1.textChanged.connect(self._sync_paths)
+        h = QHBoxLayout(); h.addWidget(QLabel("Bron:")); h.addWidget(self.s1); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s1)); h.addWidget(b); btn_i = QPushButton("ⓘ"); btn_i.clicked.connect(self.show_info); btn_i.setFixedWidth(40); h.addWidget(btn_i); l.addLayout(h)
+        hc = QHBoxLayout(); hc.addWidget(QLabel("Pauze (sec):")); self.gv = QDoubleSpinBox(); self.gv.setValue(CONFIG["MAX_GAP"]); hc.addWidget(self.gv); hc.addStretch(); l.addLayout(hc)
+        self.b1 = QPushButton("Start Sorteren", clicked=self.go1); l.addWidget(self.b1); self.p1 = self._make_thin_bar(); l.addWidget(self.p1)
+        split = QSplitter(Qt.Horizontal); self.log1 = QTextEdit(); self.log1.setReadOnly(True); self.prev1 = QLabel(); self.prev1.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev1); sc.setWidgetResizable(True); split.addWidget(self.log1); split.addWidget(sc); l.addWidget(split); split.setSizes([300, 900])
+
+    def setup_t2(self):
+        l = QVBoxLayout(self.t2); h_p = QHBoxLayout(); h_p.addWidget(QLabel("Map:")); self.s2 = QLineEdit(); h_p.addWidget(self.s2); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s2)); h_p.addWidget(b); l.addLayout(h_p)
+        ho = QHBoxLayout(); self.m2 = QComboBox(); self.m2.addItems(["Enfuse (TIFF)", "HDRmerge (DNG)", "Beide"]); ho.addWidget(self.m2)
+        ho.addWidget(QLabel("Crop:")); self.cp2 = QDoubleSpinBox(); self.cp2.setValue(1.5); ho.addWidget(self.cp2)
+        # Herstel Enfuse wegingen
+        ho.addWidget(QLabel("Exp:")); self.ew2 = QDoubleSpinBox(); self.ew2.setRange(0,1); self.ew2.setValue(1.0); self.ew2.setSingleStep(0.1); ho.addWidget(self.ew2)
+        ho.addWidget(QLabel("Sat:")); self.sw2 = QDoubleSpinBox(); self.sw2.setRange(0,1); self.sw2.setValue(0.2); self.sw2.setSingleStep(0.1); ho.addWidget(self.sw2)
+        ho.addWidget(QLabel("Con:")); self.cw2 = QDoubleSpinBox(); self.cw2.setRange(0,1); self.cw2.setValue(0.1); self.cw2.setSingleStep(0.1); ho.addWidget(self.cw2)
+        ho.addStretch(); l.addLayout(ho)
+        self.b2 = QPushButton("Start HDR", clicked=lambda: self.go_proc("HDR")); l.addWidget(self.b2)
+        v_prog = QWidget(); v_prog.setFixedHeight(60); vp_l = QVBoxLayout(v_prog); vp_l.setContentsMargins(0,0,0,0); vp_l.setSpacing(1)
+        vp_l.addWidget(QLabel("Totaal:")); self.p2 = self._make_thin_bar(); vp_l.addWidget(self.p2); vp_l.addWidget(QLabel("Huidig:"))
+        h_sub = QHBoxLayout(); self.p2_sub = self._make_thin_bar(); h_sub.addWidget(self.p2_sub); self.stop2 = QPushButton("Stop", clicked=self.stop_proc); self.stop2.setFixedWidth(50); self.stop2.setFixedHeight(18); h_sub.addWidget(self.stop2); vp_l.addLayout(h_sub); l.addWidget(v_prog)
+        self.h_split2 = QSplitter(Qt.Horizontal); self.log2 = QTextEdit(); self.log2.setReadOnly(True); self.prev2 = QLabel(); self.prev2.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev2); sc.setWidgetResizable(True); self.h_split2.addWidget(self.log2); self.h_split2.addWidget(sc); self.h_split2.setSizes([325, 975]); l.addWidget(self.h_split2)
+
+    def setup_t3(self):
+        l = QVBoxLayout(self.t3); h = QHBoxLayout(); h.addWidget(QLabel("Map:")); self.s3 = QLineEdit(); h.addWidget(self.s3); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s3)); h.addWidget(b); l.addLayout(h)
+        hb = QHBoxLayout(); self.bl3 = QComboBox(); self.bl3.addItems(["8", "16", "32"]); hb.addWidget(QLabel("Limiet:")); hb.addWidget(self.bl3); hb.addStretch(); l.addLayout(hb)
+        self.b3 = QPushButton("Start Burst", clicked=lambda: self.go_proc("BURST")); l.addWidget(self.b3)
+        v_prog3 = QWidget(); v_prog3.setFixedHeight(60); vp3_l = QVBoxLayout(v_prog3); vp3_l.setContentsMargins(0,0,0,0); vp3_l.setSpacing(1)
+        vp3_l.addWidget(QLabel("Totaal:")); self.p3 = self._make_thin_bar(); vp3_l.addWidget(self.p3); vp3_l.addWidget(QLabel("Huidig:"))
+        h_sub3 = QHBoxLayout(); self.p3_sub = self._make_thin_bar(); h_sub3.addWidget(self.p3_sub); self.stop3 = QPushButton("Stop", clicked=self.stop_proc); self.stop3.setFixedWidth(50); self.stop3.setFixedHeight(18); h_sub3.addWidget(self.stop3); vp3_l.addLayout(h_sub3); l.addWidget(v_prog3)
+        self.h_split3 = QSplitter(Qt.Horizontal); self.log3 = QTextEdit(); self.log3.setReadOnly(True); self.prev3 = QLabel(); self.prev3.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev3); sc.setWidgetResizable(True); self.h_split3.addWidget(self.log3); self.h_split3.addWidget(sc); self.h_split3.setSizes([325, 975]); l.addWidget(self.h_split3)
+
+    def setup_t4(self):
+        main_l = QVBoxLayout(self.t4); h1 = QHBoxLayout(); h1.addWidget(QLabel("Verzamelmap:")); self.s4 = QLineEdit(); h1.addWidget(self.s4); b = QPushButton("..."); b.clicked.connect(lambda: self.sel(self.s4)); h1.addWidget(b); main_l.addLayout(h1)
+        h2 = QHBoxLayout(); h2.addWidget(QLabel("Custom XMP:")); self.x4 = QLineEdit(); h2.addWidget(self.x4); b_x = QPushButton("Kies"); b_x.clicked.connect(self.sel_xmp4); h2.addWidget(b_x); main_l.addLayout(h2)
+        h3 = QHBoxLayout(); self.f4 = QComboBox(); self.f4.addItems(["TIFF/JPG", "DNG", "RAW (Serie)"]); self.f4.currentIndexChanged.connect(self.refresh_t4); h3.addWidget(self.f4); h3.addWidget(QLabel("Grootte:")); self.ts4 = QComboBox(); self.ts4.addItems(["100", "200", "300"]); self.ts4.setCurrentText("200"); self.ts4.currentIndexChanged.connect(self.refresh_t4); h3.addWidget(self.ts4); self.p4_load = self._make_thin_bar(); h3.addWidget(self.p4_load); main_l.addLayout(h3)
+        self.v_split = QSplitter(Qt.Vertical); self.lw = QListWidget(); self.lw.setViewMode(QListWidget.IconMode); self.lw.setIconSize(QSize(200, 200)); self.lw.setSelectionMode(QAbstractItemView.MultiSelection); self.v_split.addWidget(self.lw)
+        bot_w = QWidget(); bot_l = QVBoxLayout(bot_w); btn_h = QHBoxLayout(); self.b4 = QPushButton("Start Panorama", clicked=self.go4); btn_h.addWidget(self.b4); b_dt = QPushButton("Darktable", clicked=self.open_last_pano_in_dt); btn_h.addWidget(b_dt); bot_l.addLayout(btn_h)
+        h_s4 = QHBoxLayout(); self.p4_sub = self._make_thin_bar(); h_s4.addWidget(self.p4_sub); self.stop4 = QPushButton("Stop", clicked=self.stop_proc); self.stop4.setFixedWidth(50); self.stop4.setFixedHeight(18); h_s4.addWidget(self.stop4); bot_l.addLayout(h_s4)
+        self.h_split4 = QSplitter(Qt.Horizontal); self.log4 = QTextEdit(); self.log4.setReadOnly(True); self.prev4 = QLabel(); self.prev4.setAlignment(Qt.AlignCenter); sc = QScrollArea(); sc.setWidget(self.prev4); sc.setWidgetResizable(True); self.h_split4.addWidget(self.log4); self.h_split4.addWidget(sc); self.h_split4.setSizes([325, 975]); bot_l.addWidget(self.h_split4); self.v_split.addWidget(bot_w); main_l.addWidget(self.v_split)
+
+    def sel(self, e):
+        d = QFileDialog.getExistingDirectory(self, "Map", e.text());
+        if d:
+            p = os.path.abspath(d); e.setText(p)
+            self._sync_paths()
+            self.refresh_t4()
+
+    def open_last_pano_in_dt(self):
+        if self.last_pano_result and os.path.exists(self.last_pano_result): subprocess.Popen(['darktable', '--new-instance', self.last_pano_result])
+    def show_info(self): QMessageBox.information(self, "Info", "PanoStack v0.1\nLinux RAW Workflow.")
     def sel_xmp4(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Kies XMP bestand", "", "XMP Bestanden (*.xmp)")
+        f, _ = QFileDialog.getOpenFileName(self, "XMP", "", "XMP (*.xmp)");
         if f: self.x4.setText(f)
-
-    def show_info(self):
-        text = """
-        <h2 style='color: #05B8CC;'>PanoStack Flow v1.0</h2>
-        <p>This script provides a complete workflow for sorting and processing RAW photos into HDR, Bursts, and Panoramas.</p>
-
-        <h3 style='color: #05B8CC;'>1. Sorting</h3>
-        <ul>
-            <li><b>Pause:</b> The maximum time (in sec) between photos to group them into the same sequence.</li>
-            <li><b>Bracket:</b> The number of shots per HDR set (e.g., 3, 5, or 7).</li>
-        </ul>
-
-        <h3 style='color: #05B8CC;'>2. HDR & Burst</h3>
-        <ul>
-            <li><b>Alignment:</b> Uses refined control points to perfectly stack photos with active XMP corrections (such as AgX, Lens Correction, and Noise Reduction).</li>
-            <li><b>Enfuse:</b> Blends exposures into a natural 8-bit or 16-bit TIFF.</li>
-        </ul>
-
-        <h3 style='color: #05B8CC;'>3. Panorama</h3>
-        <ul>
-            <li><b>Sensitivity (0.1):</b> Highly sensitive setting to allow stitching even with low-detail areas (like clear skies).</li>
-            <li><b>Deselection:</b> Images are automatically deselected from the list after a successful stitch.</li>
-        </ul>
-
-        <p><i>Requirements: ExifTool, Darktable-cli, Enfuse, Align_image_stack, HDRmerge.</i></p>
-        """
-        QMessageBox.information(self, "System Information", text)
-
     def refresh_t4(self):
-        path_collect = self.s4.text()
-        path_source = self.s1.text()
-        idx = self.f4.currentIndex()
-        is_tif, is_dng, is_raw = (idx == 0), (idx == 1), (idx == 2)
-        self.x4.setEnabled(not is_tif); self.bx4.setEnabled(not is_tif); self.bc4.setEnabled(not is_tif)
+        path = self.s4.text();
+        if not os.path.exists(path): return
+        self.b4.setEnabled(False) # Blokkeer startknop tijdens inlezen
+        mode = self.f4.currentIndex();
+        exts = ('.tif', '.tiff', '.jpg', '.jpeg') if mode == 0 else (('.dng',) if mode == 1 else ('.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf', '.dng'))
+        sub, rec = ("TIFF" if mode == 0 else ("DNG" if mode == 1 else "")), mode == 2
 
-        if is_raw:
-            scan_p = path_source; exts = tuple(RAW_EXTS)
-        elif is_tif:
-            exts = ('.tif', '.tiff', '.jpg', '.jpeg'); sub = os.path.join(path_collect, "TIFF"); scan_p = sub if os.path.exists(sub) else path_collect
-        else: # DNG mode
-            exts = ('.dng',); sub = os.path.join(path_collect, "DNG"); scan_p = sub if os.path.exists(sub) else path_collect
+        base_sorted = os.path.join(os.path.dirname(path.rstrip(os.sep)), CONFIG["SORTED_DIR_NAME"])
+        scan_p = base_sorted if (rec and os.path.exists(base_sorted)) else (os.path.join(path, sub) if (sub and os.path.exists(os.path.join(path, sub))) else path)
 
-        if not scan_p or not os.path.exists(scan_p): self.lw.clear(); return
-        self.lw.clear(); size = int(self.ts4.currentText()); self.lw.setIconSize(QSize(size, size))
         if self.lt and self.lt.isRunning(): self.lt.quit(); self.lt.wait()
-        self.lt = QThread(); self.lwk = ThumbnailWorker(scan_p, exts); self.lwk.moveToThread(self.lt); self.lt.started.connect(self.lwk.run); self.lwk.thumb_ready.connect(self.add_thumb); self.lwk.progress.connect(self.p4_load.setValue); self.lwk.finished.connect(self.lt.quit); self.lt.start()
+        self.lt = QThread(); self.lwk = ThumbnailWorker(scan_p, exts, rec); self.lwk.moveToThread(self.lt); self.lt.started.connect(self.lwk.run); self.lwk.thumb_ready.connect(self.add_thumb); self.lwk.progress.connect(self.p4_load.setValue)
+        self.lwk.finished.connect(self.lt.quit); self.lwk.finished.connect(lambda: self.b4.setEnabled(True)) # Deblokkeer na inlezen
+        self.lt.start(); self.lw.clear()
 
     def add_thumb(self, n, p, img):
-        size = int(self.ts4.currentText())
-        it = QListWidgetItem(n); it.setData(Qt.UserRole, p); it.setIcon(QIcon(QPixmap.fromImage(img.scaled(size, size, Qt.KeepAspectRatio)))); self.lw.addItem(it)
-
+        it = QListWidgetItem(n); it.setData(Qt.UserRole, p); it.setIcon(QIcon(QPixmap.fromImage(img.scaled(int(self.ts4.currentText()), int(self.ts4.currentText()), Qt.KeepAspectRatio)))); self.lw.addItem(it)
     def stop_proc(self):
-        if self.worker: self.worker.stop(); self.log1.append("<b>Stop...</b>"); self.log2.append("<b>Stop...</b>"); self.log3.append("<b>Stop...</b>"); self.log4.append("<b>Stop...</b>")
-
-    def go1(self):
-        self.p1.setValue(0)
-        w = SortWorker(self.s1.text(), int(self.sc.currentText()), self.gv.value())
-        self._run(w, self.p1, self.log1, self.b1, self.stop1)
-
+        if self.worker: self.worker.stop()
+    def go1(self): self.log1.clear(); self._run(SortWorker(self.s1.text(), self.gv.value()), self.p1, self.log1, self.b1)
     def go_proc(self, mode):
-        p = self.s2.text() if mode == "HDR" else self.s3.text()
-        w = HdrBurstWorker(p, mode, self.m2.currentText(), self.bd2.currentText(), self.cp2.value(), int(self.bl3.currentText()) if mode == "BURST" else 0)
-        if mode == "HDR": w.sub_progress.connect(self.p2_sub.setValue)
-        else: w.sub_progress.connect(self.p3_sub.setValue)
-        self._run(w, self.p2 if mode == "HDR" else self.p3, self.log2 if mode == "HDR" else self.log3, self.b2 if mode == "HDR" else self.b3, (self.stop2 if mode == "HDR" else self.stop3))
-
+        p, log, b, stop = (self.s2.text(), self.log2, self.b2, self.stop2) if mode == "HDR" else (self.s3.text(), self.log3, self.b3, self.stop3); log.clear()
+        weights = (self.ew2.value(), self.sw2.value(), self.cw2.value()) if mode == "HDR" else (1.0, 0.2, 0.1)
+        w = HdrBurstWorker(p, mode, self.m2.currentText(), "16", self.cp2.value(), int(self.bl3.currentText()) if mode == "BURST" else 0, weights=weights)
+        w.sub_progress.connect(self.p2_sub.setValue if mode == "HDR" else self.p3_sub.setValue); self._run(w, self.p2 if mode == "HDR" else self.p3, log, b, stop)
     def go4(self):
         files = [self.lw.item(i).data(Qt.UserRole) for i in range(self.lw.count()) if self.lw.item(i).isSelected()]
         if files:
-            self.p4_sub.setValue(0)
-            is_raw_handling = self.f4.currentIndex() in [1, 2]
-            w = PanoWorker(files, self.x4.text() if (is_raw_handling and self.x4.text()) else None)
-            w.sub_progress.connect(self.p4_sub.setValue)
-            w.finished.connect(self.lw.clearSelection)
-            self._run(w, self.p4_sub, self.log4, self.b4, self.stop4)
-
+            self.log4.clear(); w = PanoWorker(files, self.x4.text()); w.sub_progress.connect(self.p4_sub.setValue); w.result_path.connect(lambda p: setattr(self, 'last_pano_result', p))
+            w.finished.connect(self.lw.clearSelection); self._run(w, self.p4_sub, self.log4, self.b4, self.stop4)
     def _run(self, w, p, log, b, s_btn=None):
-        self.worker = w; self.thread = QThread(); b.setEnabled(False); (s_btn.setEnabled(True) if s_btn else None)
-        w.moveToThread(self.thread); w.log.connect(log.append); w.progress.connect(p.setValue); w.finished.connect(self.thread.quit); w.finished.connect(lambda: (b.setEnabled(True), (s_btn.setEnabled(False) if s_btn else None)))
+        self.worker, self.thread = w, QThread(); b.setEnabled(False);
+        if s_btn: s_btn.setEnabled(True)
+        w.moveToThread(self.thread); w.log.connect(log.append); w.progress.connect(p.setValue); w.finished.connect(self.thread.quit); w.finished.connect(lambda: (b.setEnabled(True), s_btn.setEnabled(False) if s_btn else None))
         if hasattr(w, 'result_path'): w.result_path.connect(lambda path: self.show_prev(path, w))
         self.thread.started.connect(w.run); self.thread.start()
-
     def show_prev(self, path, w):
-        target = self.prev1 if isinstance(w, SortWorker) else (self.prev2 if (hasattr(w, 'mode') and w.mode == "HDR") else (self.prev3 if (hasattr(w, 'mode') and w.mode == "BURST") else self.prev4))
-        img = get_image_robust(path)
-        if not img.isNull(): target.setPixmap(QPixmap.fromImage(img).scaled(target.width(), target.height(), Qt.KeepAspectRatio))
+        t = self.prev1 if isinstance(w, SortWorker) else (self.prev2 if (hasattr(w, 'mode') and w.mode == "HDR") else (self.prev3 if (hasattr(w, 'mode') and w.mode == "BURST") else self.prev4))
+        img = get_image_robust(path);
+        if not img.isNull(): t.setPixmap(QPixmap.fromImage(img).scaled(t.width(), t.height(), Qt.KeepAspectRatio))
 
 class ThumbnailWorker(QObject):
     finished, progress, thumb_ready = Signal(), Signal(int), Signal(str, str, QImage)
-    def __init__(self, directory, extensions): super().__init__(); self.directory, self.extensions = directory, extensions
+    def __init__(self, directory, extensions, recursive=False): super().__init__(); self.directory, self.extensions, self.recursive = directory, extensions, recursive
     def run(self):
         if not os.path.exists(self.directory): self.finished.emit(); return
-        ext_tuple = tuple(e.lower() for e in self.extensions)
-        files = [os.path.join(self.directory, f) for f in sorted(os.listdir(self.directory)) if f.lower().endswith(ext_tuple)]
-        for i, fp in enumerate(files):
-            img = get_image_robust(fp);
+        fps = []
+        if self.recursive:
+            for r, _, fs in os.walk(self.directory):
+                # Alleen Serie_ mappen tonen in RAW mode
+                if "Serie_" in r:
+                    for f in sorted(fs):
+                        if f.lower().endswith(self.extensions): fps.append(os.path.join(r, f))
+        else:
+            fps = [os.path.join(self.directory, f) for f in sorted(os.listdir(self.directory)) if f.lower().endswith(self.extensions)]
+            for sub in ["DNG", "TIFF"]:
+                subp = os.path.join(self.directory, sub)
+                if os.path.exists(subp):
+                    fps += [os.path.join(subp, f) for f in sorted(os.listdir(subp)) if f.lower().endswith(self.extensions)]
+        for i, fp in enumerate(fps):
+            img = get_image_robust(fp)
             if not img.isNull(): self.thumb_ready.emit(os.path.basename(fp), fp, img)
-            self.progress.emit(int(((i + 1) / (len(files) or 1)) * 100))
+            self.progress.emit(int(((i + 1) / (len(fps) or 1)) * 100))
         self.finished.emit()
 
 if __name__ == "__main__":
