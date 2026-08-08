@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-PanoStack (v3.3.1)
-- FIX: HDRmerge (DNG) maakt nu geen TIFFs meer (logica in go_proc hersteld).
-- FIX: Reeds gemaakte DNG/TIFF bestanden (_HDR/_Pano) worden niet meer mee-gesorteerd.
-- FIX: EV correctie in Panorama-tab wordt nu correct toegepast.
-- UI: HDR & Burst Tabs: Start- en Stop-knoppen op één regel (Start groot, Stop kort).
-- INFO: Uitgebreide Engelstalige README hersteld onder de ⓘ knop in Tab 1.
-- INFO: Gedetailleerde log-informatie toegevoegd aan alle processen.
-- IMPROVED: OpenCV Ultra-HQ en Hugin CLI HQ instellingen behouden.
+PanoStack (v3.5.0)
+- INFO: FULL DETAILED COMPREHENSIVE USER MANUAL restored under the ⓘ button.
+- FIX: Panorama-tab hanging during mode switch resolved (Abort flag added to worker).
+- FIX: Thumbnail size 300 works correctly (dynamic ListWidget IconSize).
+- NEW: EV-correction options: +1 EV, -1 EV, -2 EV, -3 EV via right-click.
+- FIX: EV correction + Free XMP integration via history injection.
+- FIX: Darktable-CLI command order: <input> <xmp> <output>.
+- FIX: Binary package path doubling resolved via os.path.normpath.
+- UI: Buttons in Tab 4 equal size, distributed, with GUI checkbox next to Hugin.
+- UI: Sorter defaults (5.0s Gap, Copy 1st ON).
+- PROTECT: Sorter skips existing _HDR/_Pano files.
 """
 
 import sys
@@ -21,6 +24,14 @@ import re
 import gc
 from datetime import datetime
 
+# --- PADEN VOOR PYINSTALLER (INPAKKEN) ---
+if getattr(sys, 'frozen', False):
+    SCRIPT_DIR = sys._MEIPASS
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+
+CONFIG_FILE = os.path.join(os.path.expanduser("~"), ".panostack_config.json")
+
 # --- CONFIGURATIE ---
 DEFAULT_CONFIG = {
     "SORTED_DIR_NAME": "geordend_op_reeks",
@@ -32,8 +43,6 @@ DEFAULT_CONFIG = {
     "SAME_GAP": 5.0,
     "COPY_FIRST_TO_ROOT": True
 }
-
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "panostack_config.json")
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -57,7 +66,6 @@ VALID_EXTS = {ext.lower() for ext in ['.rw2', '.arw', '.cr2', '.cr3', '.nef', '.
 cores = os.cpu_count() or 2
 ENV_STABLE = os.environ.copy()
 ENV_STABLE["OMP_NUM_THREADS"] = str(max(1, cores - 1))
-SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 
 # --- IMPORTS ---
 try:
@@ -154,8 +162,35 @@ def find_best_xmp(folder_path):
     return global_xmp if os.path.exists(global_xmp) else None
 
 def create_exposure_xmp(ev_value, base_xmp=None):
+    """Maakt een tijdelijk XMP bestand aan met de gewenste belichtingscorrectie,
+    gecombineerd met de bestaande geschiedenis van de basis-XMP."""
     tmp_xmp = tempfile.NamedTemporaryFile(suffix=".xmp", delete=False).name
-    ev_param = "0000000000000000000080bf0000803f0000803f" if ev_value == -1 else "0000000000000000000000c00000803f0000803f"
+    # Mapping van EV naar Darktable Float Hex
+    ev_map = { 1: "0000803f", -1: "000080bf", -2: "000000c0", -3: "000040c0" }
+    ev_param = ev_map.get(ev_value, "00000000")
+
+    if base_xmp and os.path.exists(base_xmp):
+        try:
+            with open(base_xmp, 'r') as f:
+                content = f.read()
+            if "<darktable:history>" in content and "</rdf:Seq>" in content:
+                new_li = f"""     <rdf:li
+      darktable:num="999"
+      darktable:module="exposure"
+      darktable:operation="exposure"
+      darktable:enabled="1"
+      darktable:modversion="6"
+      darktable:params="0000000000000000{ev_param}0000803f0000803f"
+      darktable:multi_priority="0"
+      darktable:multi_name=""
+      darktable:iop_order="21.0000000000000"/>
+    </rdf:Seq>"""
+                content = content.replace("</rdf:Seq>", new_li)
+                content = re.sub(r'darktable:history_end="\d+"', 'darktable:history_end="1000"', content)
+                with open(tmp_xmp, "w") as f: f.write(content)
+                return tmp_xmp
+        except: pass
+
     xmp_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="XMP Core 4.4.0-Exiv2">
  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
@@ -163,9 +198,8 @@ def create_exposure_xmp(ev_value, base_xmp=None):
    <darktable:history>
     <rdf:Seq>
      <rdf:li darktable:num="0" darktable:module="exposure" darktable:operation="exposure" darktable:enabled="1" darktable:modversion="6"
-      darktable:params="{ev_param}" darktable:multi_priority="0" darktable:multi_name="" darktable:iop_order="21.0000000000000"/>
-    </rdf:Seq>
-   </darktable:history>
+      darktable:params="0000000000000000{ev_param}0000803f0000803f" darktable:multi_priority="0" darktable:multi_name="" darktable:iop_order="21.0000000000000"/>
+    </rdf:Seq>   </darktable:history>
   </rdf:Description>
  </rdf:RDF>
 </x:xmpmeta>"""
@@ -203,19 +237,16 @@ class SortWorker(BaseWorker):
         try:
             self.log.emit(f"<b style='color:#2980b9;'>Analyse start in:</b> {self.source_dir}")
             all_paths = []
-            results_found = 0
+            res_skipped = 0
             for root, _, files in os.walk(self.source_dir):
                 for f in files:
                     if any(f.lower().endswith(ext) for ext in VALID_EXTS) and not f.lower().endswith('.xmp'):
                         if "_HDR" in f or "_Pano" in f:
-                            results_found += 1
-                            continue
+                            res_skipped += 1; continue
                         all_paths.append(os.path.join(root, f))
             all_paths.sort()
-            if results_found > 0:
-                self.log.emit(f"<i>-> {results_found} resultaten (_HDR/_Pano) genegeerd en behouden.</i>")
+            if res_skipped > 0: self.log.emit(f"<i>-> {res_skipped} resultaten (_HDR/_Pano) behouden in hoofdmap.</i>")
             if not all_paths: self.log.emit("Geen bestanden."); self.finished.emit(); return
-            self.log.emit(f"<i>-> Analyse van {len(all_paths)} bestanden op tijd en belichting...</i>")
             photos = []
             for i in range(0, len(all_paths), 40):
                 if not self._is_running: break
@@ -236,13 +267,12 @@ class SortWorker(BaseWorker):
             curr, seq = [], 0
             for idx, p in enumerate(photos):
                 if not self._is_running: break
-                is_same = curr and (p['exp'] == curr[-1]['exp'] and p['iso'] == curr[-1]['iso'])
-                limit = self.same_gap if is_same else self.max_gap
+                limit = self.same_gap if curr and (p['exp'] == curr[-1]['exp'] and p['iso'] == curr[-1]['iso']) else self.max_gap
                 if not curr or (p['ts'] - curr[-1]['ts'] <= limit): curr.append(p)
                 else: seq = self._process_group(curr, dest_root, seq); curr = [p]
                 self.progress.emit(int(((idx + 1) / len(photos)) * 100))
             if curr: seq = self._process_group(curr, dest_root, seq)
-            self.log.emit(f"<br><b style='color:#27ae60;'>✓ Sorteren voltooid. {seq} groepen aangemaakt.</b>")
+            self.log.emit(f"<br><b style='color:#27ae60;'>✓ Sorteren voltooid.</b>")
         except Exception as e: self.log.emit(f"Fout: {e}")
         finally: self.finished.emit()
     def _process_group(self, group, dest_root, seq):
@@ -255,7 +285,7 @@ class SortWorker(BaseWorker):
         seq += 1
         target = os.path.join(dest_root, group[0]['model'], group[0]['date'], f"{type_p}_{seq:03d}")
         os.makedirs(target, exist_ok=True)
-        self.log.emit(f"  -> {type_p}_{seq:03d}: {len(group)} foto's verplaatst.")
+        self.log.emit(f"  -> {type_p}_{seq:03d}: {len(group)} foto's")
         for f in group:
             dest = os.path.join(target, f['name'])
             if f['full_path'] != dest: shutil.move(f['full_path'], dest)
@@ -280,10 +310,10 @@ class HdrBurstWorker(BaseWorker):
                 for d in ds:
                     if d.startswith(prefix): subdirs.append(os.path.join(r, d))
             subdirs = sorted(list(set(subdirs)))
-            if not subdirs: self.log.emit("Geen mappen gevonden."); self.finished.emit(); return
+            if not subdirs: self.log.emit(f"<b style='color:#e67e22;'>Geen {prefix} mappen gevonden.</b>"); self.finished.emit(); return
             coll_root = os.path.join(os.path.dirname(self.base_dir.rstrip(os.sep)), CONFIG["HDR_COLLECT_NAME"])
             os.makedirs(os.path.join(coll_root, "DNG"), exist_ok=True); os.makedirs(os.path.join(coll_root, "TIFF"), exist_ok=True)
-            self.log.emit(f"<b style='color:#2980b9;'>Stacking start:</b> {len(subdirs)} mappen.")
+            self.log.emit(f"<b style='color:#2980b9;'>Stacking gestart:</b> {len(subdirs)} mappen.")
             for i, path in enumerate(subdirs):
                 if not self._is_running: break
                 name, xmp = os.path.basename(path), find_best_xmp(path)
@@ -292,11 +322,11 @@ class HdrBurstWorker(BaseWorker):
                 if self.mode == "HDR" and ("hdrmerge" in self.method or "beide" in self.method) and not os.path.exists(coll_dng):
                     raws = sorted([os.path.join(path, f) for f in os.listdir(path) if any(f.lower().endswith(ex) for ex in ['.dng','.rw2','.arw','.cr2','.cr3','.nef']) and "_HDR" not in f])
                     out = os.path.join(path, f"{name}_HDR.dng")
-                    self.log.emit(f"  -> HDRmerge start...")
+                    self.log.emit(f"  -> HDRmerge (DNG)...")
                     if self.safe_run(['hdrmerge', '-b', '16', '-o', out] + raws) == 0:
                         smart_copy(out, coll_dng); self.result_path.emit(out)
                 if (self.mode == "BURST" or "enfuse" in self.method or "beide" in self.method) and not os.path.exists(coll_tif):
-                    self.log.emit(f"  -> Enfuse/Median start...")
+                    self.log.emit(f"  -> Enfuse/Median (TIFF)...")
                     res = self._do_enfuse(path, name, xmp)
                     if res: smart_copy(res, coll_tif); self.result_path.emit(res)
                 self.progress.emit(int(((i + 1) / len(subdirs)) * 100))
@@ -311,12 +341,12 @@ class HdrBurstWorker(BaseWorker):
             tifs = []
             for idx, f in enumerate(files):
                 out = os.path.join(tmp_dir, f"img_{idx:03d}.tif")
-                cmd = ['darktable-cli', os.path.join(path, f), out, '--core', '--library', ':memory:', '--disable-opencl']
-                if xmp: cmd.insert(2, xmp)
+                cmd = ['darktable-cli', os.path.join(path, f)]
+                if xmp: cmd.append(xmp)
+                cmd.extend([out, '--core', '--library', ':memory:', '--disable-opencl'])
                 if self.safe_run(cmd) == 0: tifs.append(out)
                 self.sub_progress.emit(int(((idx + 1) / len(files)) * 70))
             if len(tifs) < 2: return None
-            self.log.emit(f"  -> Uitlijnen...")
             ali = os.path.join(tmp_dir, "ali_")
             self.safe_run(['align_image_stack', '-m', '10', '-a', ali, '-c', '20', '-z', '-x', '-y'] + tifs)
             alis = sorted(glob.glob(os.path.join(tmp_dir, "ali_*.tif")))
@@ -347,9 +377,7 @@ class PanoWorker(BaseWorker):
                     if f.lower().endswith(('.dng','.rw2','.arw','.cr2','.cr3','.nef','.orf','.raf')) or ev != 0:
                         t = os.path.join(tmp_dir, f"p_{i}.tif")
                         xmp = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp(os.path.dirname(f))
-                        if ev != 0:
-                            self.log.emit(f"  -> EV {ev}: {os.path.basename(f)}")
-                            xmp = create_exposure_xmp(ev, xmp)
+                        if ev != 0: xmp = create_exposure_xmp(ev, xmp)
                         cmd = ['darktable-cli', f]
                         if xmp: cmd.append(xmp)
                         cmd.extend([t, '--core', '--library', ':memory:', '--disable-opencl'])
@@ -374,8 +402,7 @@ class PanoWorker(BaseWorker):
                         os.makedirs(self.output_dir, exist_ok=True)
                         fname = f"{os.path.splitext(os.path.basename(self.files[0]))[0]}_Pano.tif"
                         out = os.path.join(self.output_dir, fname)
-                        cv2.imwrite(out, res); self.log.emit("✓ Gereed."); self.result_path.emit(out)
-                    else: self.log.emit("Fout: OpenCV stitching mislukt.")
+                        cv2.imwrite(out, res); self.log.emit("✓ Ready."); self.result_path.emit(out)
                 self.progress.emit(100)
             except Exception as e: self.log.emit(f"Fout: {e}")
             finally: self.finished.emit()
@@ -406,7 +433,6 @@ class HuginCliWorker(BaseWorker):
                     self.sub_progress.emit(int(((i+1)/len(self.files))*20))
                 if not tiffs: return
                 pto, prefix = os.path.join(tmp, "p.pto"), os.path.join(tmp, "out")
-                self.log.emit("<i> -> Project genereren...</i>")
                 self.safe_run(['pto_gen', '-o', pto] + tiffs)
                 self.safe_run(['cpfind', '--multirow', '--celeste', '-o', pto, pto])
                 self.safe_run(['cpclean', '-o', pto, pto])
@@ -426,7 +452,7 @@ class HuginCliWorker(BaseWorker):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PanoStack v3.3.1")
+        self.setWindowTitle("PanoStack v3.5.0")
         self.resize(1300, 900)
         missing, deps = check_dependencies()
         if missing: QMessageBox.warning(self, "Readiness", f"Missing: {missing}")
@@ -442,8 +468,8 @@ class MainWindow(QMainWindow):
     def _sync_paths(self):
         p = self.s1.text().strip()
         if p and os.path.exists(p):
-            sp = os.path.join(p, CONFIG["SORTED_DIR_NAME"])
-            self.s2.setText(sp); self.s3.setText(sp); self.s4.setText(os.path.join(p, CONFIG["HDR_COLLECT_NAME"]))
+            sp = os.path.normpath(os.path.join(p, CONFIG["SORTED_DIR_NAME"]))
+            self.s2.setText(sp); self.s3.setText(sp); self.s4.setText(os.path.normpath(os.path.join(p, CONFIG["HDR_COLLECT_NAME"])))
     def _make_thin_bar(self):
         pb = QProgressBar(); pb.setFixedHeight(8); pb.setTextVisible(False); pb.setStyleSheet("QProgressBar { border: 1px solid #bbb; background: #eee; } QProgressBar::chunk { background: #05B8CC; }")
         pb.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); return pb
@@ -468,7 +494,9 @@ class MainWindow(QMainWindow):
         h_main.addWidget(QLabel("Con:")); self.cw2 = QDoubleSpinBox(); self.cw2.setRange(0,1); self.cw2.setValue(0.1); h_main.addWidget(self.cw2); l.addLayout(h_main)
         h_ctrl = QHBoxLayout(); self.b2 = QPushButton("Start HDR"); self.b2.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.b2.clicked.connect(lambda: self.go_proc("HDR")); h_ctrl.addWidget(self.b2)
         self.stop2 = QPushButton("Stop"); self.stop2.setFixedWidth(80); self.stop2.clicked.connect(self.stop_proc); h_ctrl.addWidget(self.stop2); l.addLayout(h_ctrl)
-        v_prog = QWidget(); v_prog.setFixedHeight(40); vp_l = QVBoxLayout(v_prog); vp_l.setContentsMargins(0,0,0,0); vp_l.addWidget(QLabel("Totaal:")); self.p2 = QProgressBar(); self.p2.setFixedHeight(8); vp_l.addWidget(self.p2); l.addWidget(v_prog)
+        v_prog = QWidget(); v_prog.setFixedHeight(60); vp_l = QVBoxLayout(v_prog); vp_l.setContentsMargins(0,0,0,0);
+        vp_l.addWidget(QLabel("Totaal:")); self.p2 = self._make_thin_bar(); vp_l.addWidget(self.p2)
+        vp_l.addWidget(QLabel("Huidig:")); self.p2_sub = self._make_thin_bar(); vp_l.addWidget(self.p2_sub); l.addWidget(v_prog)
         h_split2 = QSplitter(Qt.Horizontal); self.log2 = QTextEdit(); self.log2.setReadOnly(True); self.prev2 = QLabel(); self.prev2.setAlignment(Qt.AlignCenter)
         sc = QScrollArea(); sc.setWidget(self.prev2); sc.setWidgetResizable(True); h_split2.addWidget(self.log2); h_split2.addWidget(sc); h_split2.setSizes([325, 975]); l.addWidget(h_split2)
         self.m2.addItems(["Enfuse (TIFF)", "HDRmerge (DNG)", "Beide"]); self.m2.currentIndexChanged.connect(self.update_enfuse_visibility); self.update_enfuse_visibility()
@@ -477,55 +505,75 @@ class MainWindow(QMainWindow):
         self.bl3 = QComboBox(); self.bl3.addItems(["8", "16", "32"]); h.addWidget(QLabel("Limiet:")); h.addWidget(self.bl3); l.addLayout(h)
         h_ctrl = QHBoxLayout(); self.b3 = QPushButton("Start Burst"); self.b3.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.b3.clicked.connect(lambda: self.go_proc("BURST")); h_ctrl.addWidget(self.b3)
         self.stop3 = QPushButton("Stop"); self.stop3.setFixedWidth(80); self.stop3.clicked.connect(self.stop_proc); h_ctrl.addWidget(self.stop3); l.addLayout(h_ctrl)
-        v_prog = QWidget(); v_prog.setFixedHeight(40); vp_l = QVBoxLayout(v_prog); vp_l.setContentsMargins(0,0,0,0); vp_l.addWidget(QLabel("Totaal:")); self.p3 = QProgressBar(); self.p3.setFixedHeight(8); vp_l.addWidget(self.p3); l.addWidget(v_prog)
+        v_prog = QWidget(); v_prog.setFixedHeight(60); vp_l = QVBoxLayout(v_prog); vp_l.setContentsMargins(0,0,0,0);
+        vp_l.addWidget(QLabel("Totaal:")); self.p3 = self._make_thin_bar(); vp_l.addWidget(self.p3)
+        vp_l.addWidget(QLabel("Huidig:")); self.p3_sub = self._make_thin_bar(); vp_l.addWidget(self.p3_sub); l.addWidget(v_prog)
         h_split3 = QSplitter(Qt.Horizontal); self.log3 = QTextEdit(); self.log3.setReadOnly(True); self.prev3 = QLabel(); self.prev3.setAlignment(Qt.AlignCenter)
         sc = QScrollArea(); sc.setWidget(self.prev3); sc.setWidgetResizable(True); h_split3.addWidget(self.log3); h_split3.addWidget(sc); h_split3.setSizes([325, 975]); l.addWidget(h_split3)
     def setup_t4(self):
         main_l = QVBoxLayout(self.t4); h_paths = QHBoxLayout(); h_paths.addWidget(QLabel("Verzamelmap:")); self.s4 = QLineEdit(); h_paths.addWidget(self.s4)
         b = QPushButton("..."); b.clicked.connect(lambda: self.sel_dir(self.s4)); h_paths.addWidget(b); self.lbl_x4 = QLabel("Vrije XMP:"); h_paths.addWidget(self.lbl_x4); self.x4 = QLineEdit(); h_paths.addWidget(self.x4)
         self.b_xmp4 = QPushButton("Kies"); self.b_xmp4.clicked.connect(self.sel_xmp); h_paths.addWidget(self.b_xmp4); main_l.addLayout(h_paths)
-        h_opts = QHBoxLayout(); self.f4 = QComboBox(); self.f4.addItems(["TIFF/JPG", "DNG", "RAW (Serie)", "RAW (enkel)"]); self.f4.currentIndexChanged.connect(self.refresh_t4); h_opts.addWidget(self.f4)
-        self.ts4 = QComboBox(); self.ts4.addItems(["100", "200", "300"]); self.ts4.setCurrentText("200"); h_opts.addWidget(self.ts4); self.p4_load = QProgressBar(); self.p4_load.setFixedHeight(8); self.p4_load.setTextVisible(False); h_opts.addWidget(self.p4_load); main_l.addLayout(h_opts)
+        h_opts = QHBoxLayout(); self.f4 = QComboBox(); self.f4.addItems(["TIFF/JPG", "DNG", "RAW (Serie)", "RAW (enkel)"]); self.f4.currentIndexChanged.connect(lambda idx: self.update_refresh_all()); h_opts.addWidget(self.f4)
+        self.ts4 = QComboBox(); self.ts4.addItems(["100", "200", "300"]); self.ts4.setCurrentText("200"); self.ts4.currentIndexChanged.connect(lambda idx: self.update_refresh_all()); h_opts.addWidget(self.ts4); self.p4_load = self._make_thin_bar(); h_opts.addWidget(self.p4_load); main_l.addLayout(h_opts)
         self.v_split = QSplitter(Qt.Vertical); self.lw = QListWidget(); self.lw.setViewMode(QListWidget.IconMode); self.lw.setIconSize(QSize(200, 200)); self.lw.setSelectionMode(QAbstractItemView.MultiSelection); self.lw.setContextMenuPolicy(Qt.CustomContextMenu); self.lw.customContextMenuRequested.connect(self.show_context)
         self.v_split.addWidget(self.lw); bot_w = QWidget(); bot_l = QVBoxLayout(bot_w); btn_h = QHBoxLayout()
         self.b4 = QPushButton("Start openCV (8 bit)"); self.b4.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.b4.clicked.connect(self.go4); btn_h.addWidget(self.b4)
         self.b_hu = QPushButton("Start Hugin (16 bit)"); self.b_hu.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.b_hu.clicked.connect(self.go_hugin)
         btn_h.addWidget(self.b_hu); self.cb_hugin_gui = QCheckBox("Open GUI"); self.cb_hugin_gui.setFixedWidth(90); btn_h.addWidget(self.cb_hugin_gui)
         self.b_dt = QPushButton("Start Darktable"); self.b_dt.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed); self.b_dt.clicked.connect(self.open_dt); btn_h.addWidget(self.b_dt); bot_l.addLayout(btn_h)
-        h_s4 = QHBoxLayout(); self.p4_sub = QProgressBar(); self.p4_sub.setFixedHeight(8); self.p4_sub.setTextVisible(False); h_s4.addWidget(self.p4_sub); self.stop4 = QPushButton("Stop"); self.stop4.setFixedWidth(50); self.stop4.setFixedHeight(18); self.stop4.clicked.connect(self.stop_proc); h_s4.addWidget(self.stop4); bot_l.addLayout(h_s4)
+        h_s4 = QHBoxLayout(); self.p4_sub = self._make_thin_bar(); h_s4.addWidget(self.p4_sub); self.stop4 = QPushButton("Stop"); self.stop4.setFixedWidth(50); self.stop4.setFixedHeight(18); self.stop4.clicked.connect(self.stop_proc); h_s4.addWidget(self.stop4); bot_l.addLayout(h_s4)
         h_split4 = QSplitter(Qt.Horizontal); self.log4 = QTextEdit(); self.log4.setReadOnly(True); self.prev4 = QLabel(); self.prev4.setAlignment(Qt.AlignCenter)
         sc = QScrollArea(); sc.setWidget(self.prev4); sc.setWidgetResizable(True); h_split4.addWidget(self.log4); h_split4.addWidget(sc); h_split4.setSizes([325, 975]); bot_l.addWidget(h_split4); self.v_split.addWidget(bot_w); main_l.addWidget(self.v_split); self.update_pano_xmp_visibility()
     def show_context(self, pos):
         item = self.lw.itemAt(pos)
         if not item: return
-        menu = QMenu(); a0 = QAction("Normal (0 EV)", self); a1 = QAction("-1 Stop (EV)", self); a2 = QAction("-2 Stops (EV)", self); menu.addActions([a0, a1, a2])
+        menu = QMenu(); a_p1 = QAction("+1 Stop (EV)", self); a0 = QAction("Normal (0 EV)", self); a_m1 = QAction("-1 Stop (EV)", self); a_m2 = QAction("-2 Stops (EV)", self); a_m3 = QAction("-3 Stops (EV)", self); menu.addActions([a_p1, a0, a_m1, a_m2, a_m3])
         action = menu.exec(self.lw.mapToGlobal(pos)); path = item.data(Qt.UserRole)
         if action == a0: item.setData(Qt.UserRole + 1, 0); item.setText(os.path.basename(path)); item.setBackground(QBrush(Qt.transparent))
-        elif action == a1: item.setData(Qt.UserRole + 1, -1); item.setText(f"{os.path.basename(path)} [-1 EV]"); item.setBackground(QBrush(QColor(255, 230, 230)))
-        elif action == a2: item.setData(Qt.UserRole + 1, -2); item.setText(f"{os.path.basename(path)} [-2 EV]"); item.setBackground(QBrush(QColor(255, 180, 180)))
+        elif action == a_p1: item.setData(Qt.UserRole + 1, 1); item.setText(f"{os.path.basename(path)} [+1 EV]"); item.setBackground(QBrush(QColor(230, 255, 230)))
+        elif action == a_m1: item.setData(Qt.UserRole + 1, -1); item.setText(f"{os.path.basename(path)} [-1 EV]"); item.setBackground(QBrush(QColor(255, 230, 230)))
+        elif action == a_m2: item.setData(Qt.UserRole + 1, -2); item.setText(f"{os.path.basename(path)} [-2 EV]"); item.setBackground(QBrush(QColor(255, 200, 200)))
+        elif action == a_m3: item.setData(Qt.UserRole + 1, -3); item.setText(f"{os.path.basename(path)} [-3 EV]"); item.setBackground(QBrush(QColor(255, 150, 150)))
     def show_readme(self):
-        text = """<h2 style='color:#2980b9;'>PanoStack v3.3.1 - README</h2>
-        <p><b>PanoStack</b> is an automated HQ RAW workflow utility for photographers designed to streamline sorting, stacking, and panorama stitching.</p>
-        <h3 style='color:#2c3e50;'>1. Sorting Tab</h3>
+        text = """<h2 style='color:#2980b9;'>PanoStack v3.5.0 - User Manual</h2>
+        <p><b>PanoStack</b> is an automated high-performance HQ RAW workflow utility for professional photographers.</p>
+
+        <h3 style='color:#2c3e50;'>1. Sorting Tab (The Foundation)</h3>
         <ul>
-            <li><b>HDR Gap:</b> Max time between shots with different exposures.</li>
-            <li><b>Burst Gap:</b> Max time between shots with identical exposures.</li>
-            <li><b>ISO Logic:</b> ISO > 800 + fast shots = 'Burst', otherwise 'Serie'.</li>
-            <li><b>Protection:</b> Sorting skips existing _HDR and _Pano files.</li>
+            <li><b>HDR Gap:</b> Max time (s) between bracketed shots with different exposure settings.</li>
+            <li><b>Burst Gap:</b> Max time (s) between shots with identical exposures (panoramas/bursts). <b>Default: 5.0s</b>.</li>
+            <li><b>Copy 1st frame:</b> Enables a <b>Non-HDR Workflow</b>. By keeping a reference of the first frame in the root, you can stitch a fast preview panorama without waiting for HDR stacking.</li>
+            <li><b>Protection:</b> Existing <i>_HDR</i> and <i>_Pano</i> files are ignored during sorting to prevent them from being moved.</li>
         </ul>
-        <h3 style='color:#2c3e50;'>2. Stacking & Panorama</h3>
+
+        <h3 style='color:#2c3e50;'>2. Stacking & Noise Reduction</h3>
         <ul>
-            <li><b>Exposure Fix:</b> Right-click any thumbnail in Tab 4 to apply -1 or -2 EV.</li>
-            <li><b>Hugin CLI:</b> HQ stitching with automatic horizon leveling and photometric matching.</li>
-            <li><b>OpenCV:</b> Fast 8-bit Ultra-HQ stitching using SIFT and GraphCut seams.</li>
-        </ul>"""
-        QMessageBox.information(self, "README", text)
+            <li><b>HDR Stacking:</b> Combine brackets into 32-bit DNG (HDRmerge) or 16-bit TIFF (Enfuse).</li>
+            <li><b>Burst Stacking:</b> Handheld noise reduction via median pixel evaluation (8-32 frames recommended).</li>
+            <li><b>Dual Progress:</b> Total progress (upper bar) and individual file progress (lower bar) are displayed.</li>
+        </ul>
+
+        <h3 style='color:#2c3e50;'>3. Panorama Tab & Exposure Fix</h3>
+        <ul>
+            <li><b>Free XMP:</b> Apply a custom Darktable XMP to all frames for consistent color and lens correction. <i>Lens correction is highly recommended for perfect stitching.</i></li>
+            <li><b>Exposure Fix:</b> HDRmerge results can sometimes show baseline jumps. <u>Right-click</u> any thumbnail to adjust brightness (+1 to -3 EV). This is automatically <i>injected</i> into your XMP history, preserving all other settings.</li>
+            <li><b>Engines:</b> 16-bit Hugin CLI (auto-leveling) or fast Ultra-HQ OpenCV.</li>
+        </ul>
+
+        <h3 style='color:#2c3e50;'>System Dependencies (Arch Linux)</h3>
+        <p><code>sudo pacman -S darktable hugin enblend-enfuse perl-image-exiftool imagemagick python-pyside6 python-opencv python-numpy</code></p>
+        <p>AUR (Required for DNG): <code>yay -S hdrmerge</code></p>
+        """
+        QMessageBox.information(self, "User Manual", text)
     def sel_dir(self, edit):
-        d = QFileDialog.getExistingDirectory(self, "Kies Map", edit.text())
-        if d: edit.setText(os.path.abspath(d)); self._sync_paths()
+        d = QFileDialog.getExistingDirectory(self, "Kies Map", edit.text(), QFileDialog.Option.DontUseNativeDialog)
+        if d: edit.setText(os.path.normpath(d)); self._sync_paths(); self.refresh_t4()
     def sel_xmp(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Kies XMP", "", "XMP (*.xmp)")
+        f, _ = QFileDialog.getOpenFileName(self, "Kies XMP", "", "XMP (*.xmp)", options=QFileDialog.Option.DontUseNativeDialog)
         if f: self.x4.setText(f)
+    def update_refresh_all(self):
+        sz = int(self.ts4.currentText()); self.lw.setIconSize(QSize(sz, sz)); self.refresh_t4()
     def update_enfuse_visibility(self):
         is_enf = self.m2.currentText() != "HDRmerge (DNG)"
         for w in [self.ew2, self.sw2, self.cw2, self.cp2]: w.setEnabled(is_enf)
@@ -543,9 +591,11 @@ class MainWindow(QMainWindow):
         exts = (('.tif', '.tiff', '.jpg', '.jpeg') if mode == 0 else (('.dng',) if mode == 1 else (('.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf', '.dng'))))
         inc_first, f_filter, rec = False, None, True
         if mode == 3: scan_p, rec, inc_first, f_filter = root, False, True, ("Serie_", "Reeks_", "Burst_")
-        elif mode == 2: scan_p, f_filter = os.path.join(root, CONFIG["SORTED_DIR_NAME"]), ("Serie_",)
-        else: scan_p = self.s4.text()
-        if hasattr(self, 'lt') and self.lt and self.lt.isRunning(): self.lt.quit(); self.lt.wait()
+        elif mode == 2: scan_p, f_filter = os.path.normpath(os.path.join(root, CONFIG["SORTED_DIR_NAME"])), ("Serie_",)
+        else: sub = "TIFF" if mode == 0 else "DNG"; scan_p = os.path.normpath(os.path.join(path, sub)) if os.path.exists(os.path.join(path, sub)) else path
+        if hasattr(self, 'lt') and self.lt and self.lt.isRunning():
+            if hasattr(self, 'lwk') and self.lwk: self.lwk.is_aborted = True
+            self.lt.quit(); self.lt.wait()
         self.lt = QThread(); self.lwk = ThumbnailWorker(scan_p, exts, rec, inc_first, f_filter)
         self.lwk.moveToThread(self.lt); self.lt.started.connect(self.lwk.run); self.lwk.thumb_ready.connect(self.add_thumb)
         self.lwk.progress.connect(self.p4_load.setValue); self.lwk.finished.connect(self.lt.quit); self.lt.start(); self.lw.clear()
@@ -559,8 +609,10 @@ class MainWindow(QMainWindow):
         w.finished.connect(self.refresh_t4); self._run(w, self.p1, self.log1, self.b1)
     def go_proc(self, mode):
         p, log, b, stop = (self.s2.text(), self.log2, self.b2, self.stop2) if mode == "HDR" else (self.s3.text(), self.log3, self.b3, self.stop3)
-        log.clear(); w = HdrBurstWorker(p, mode, self.m2.currentText() if mode=="HDR" else "Median", "16", 1.5, 0, (1.0, 0.2, 0.1))
-        pb = self.p2 if mode == "HDR" else self.p3; self._run(w, pb, log, b, stop)
+        log.clear(); meth = self.m2.currentText() if mode == "HDR" else "Median"
+        w = HdrBurstWorker(p, mode, meth, "16", 1.5, 0, (1.0, 0.2, 0.1))
+        pb, ps = (self.p2, self.p2_sub) if mode == "HDR" else (self.p3, self.p3_sub)
+        w.sub_progress.connect(ps.setValue); self._run(w, pb, log, b, stop)
     def go4(self):
         items = self.lw.selectedItems()
         if items:
@@ -588,8 +640,7 @@ class MainWindow(QMainWindow):
                     cmd = ['darktable-cli', f];
                     if xmp: cmd.append(xmp)
                     cmd.extend([tif, '--core', '--library', ':memory:', '--disable-opencl'])
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL)
-                    if os.path.exists(tif): final_p.append(tif)
+                    subprocess.run(cmd, stdout=subprocess.DEVNULL); final_p.append(tif)
                 else: final_p.append(os.path.abspath(f))
             if final_p: subprocess.Popen(['hugin'] + final_p)
         else:
@@ -624,11 +675,13 @@ class ThumbnailWorker(QObject):
     def __init__(self, directory, extensions, recursive=False, inc_first=False, folder_filter=None):
         super().__init__()
         self.directory, self.extensions, self.recursive, self.inc_first, self.folder_filter = directory, extensions, recursive, inc_first, folder_filter
+        self.is_aborted = False
     def run(self):
         if not os.path.exists(self.directory): self.finished.emit(); return
         found, fps = set(), []
         if self.recursive:
             for r, _, fs in os.walk(self.directory):
+                if self.is_aborted: break
                 if self.folder_filter and not os.path.basename(r).startswith(self.folder_filter): continue
                 for f in sorted(fs):
                     if f.lower().endswith(self.extensions):
@@ -636,21 +689,24 @@ class ThumbnailWorker(QObject):
                         if p not in found: fps.append(p); found.add(p)
         else:
             for f in sorted(os.listdir(self.directory)):
+                if self.is_aborted: break
                 if f.lower().endswith(self.extensions):
                     p = os.path.join(self.directory, f); fps.append(p); found.add(p)
             if self.inc_first:
                 s_root = os.path.join(self.directory, CONFIG["SORTED_DIR_NAME"])
                 if os.path.exists(s_root):
                     for r, ds, fs in os.walk(s_root):
+                        if self.is_aborted: break
                         if os.path.basename(r).startswith(("Serie_", "Reeks_", "Burst_")):
                             v_fs = sorted([f for f in fs if f.lower().endswith(self.extensions)])
                             if v_fs:
                                 p = os.path.join(r, v_fs[0])
                                 if p not in found: fps.append(p); found.add(p)
         for i, fp in enumerate(fps):
+            if self.is_aborted: break
             img = get_image_robust(fp)
             if not img.isNull(): self.thumb_ready.emit(os.path.basename(fp), fp, img)
-            self.progress.emit(int(((i+1)/len(fps))*100))
+            self.progress.emit(int(((i + 1) / (len(fps) or 1)) * 100))
         self.finished.emit()
 
 if __name__ == "__main__":
