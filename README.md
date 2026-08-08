@@ -53,4 +53,3 @@ Waarom deze versie goed is:
 4.  Duidelijke stappen: De EV-fix (je nieuwste functie) wordt uitgelegd als een
     simpel 1-2-3 stappenplan.
 
-Zal ik deze tekst nu definitief in de code van de informatieknop zetten voor je?
