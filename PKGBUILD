@@ -6,7 +6,7 @@ arch=('any')
 license=('GPL')
 # Arch gebruikt meestal de 'python-' prefix voor bibliotheken
 depends=('python' 'pyside6' 'python-opencv' 'python-numpy' 'darktable' 'hugin' 'enblend-enfuse' 'perl-image-exiftool' 'imagemagick')
-source=('panostack.py' 'oppepper.xmp')
+source=('panoStack.py' 'oppepper.xmp')
 
 # Dit lost de 'Integriteitscontroles' fout op
 sha256sums=('SKIP' 'SKIP')
@@ -17,7 +17,7 @@ package() {
   install -d "$pkgdir/usr/bin"
 
   # Kopieer het script en de XMP naar de share map
-  install -m755 "$srcdir/panostack.py" "$pkgdir/usr/share/panostack/panostack.py"
+  install -m755 "$srcdir/panoStack.py" "$pkgdir/usr/share/panostack/panostack.py"
   install -m644 "$srcdir/oppepper.xmp" "$pkgdir/usr/share/panostack/oppepper.xmp"
 
   # Maak een symlink in /usr/bin zodat je 'panostack' kunt typen in de terminal
