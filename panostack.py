@@ -570,7 +570,7 @@ class MainWindow(QMainWindow):
         d = QFileDialog.getExistingDirectory(self, "Kies Map", edit.text(), QFileDialog.Option.DontUseNativeDialog)
         if d: edit.setText(os.path.normpath(d)); self._sync_paths(); self.refresh_t4()
     def sel_xmp(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Kies XMP", "", "XMP (*.xmp)", options=QFileDialog.Option.DontUseNativeDialog)
+        f, _ = QFileDialog.getOpenFileName(self, "Kies XMP", "", "XMP (*.xmp)")
         if f: self.x4.setText(f)
     def update_refresh_all(self):
         sz = int(self.ts4.currentText()); self.lw.setIconSize(QSize(sz, sz)); self.refresh_t4()
@@ -578,8 +578,8 @@ class MainWindow(QMainWindow):
         is_enf = self.m2.currentText() != "HDRmerge (DNG)"
         for w in [self.ew2, self.sw2, self.cw2, self.cp2]: w.setEnabled(is_enf)
     def update_pano_xmp_visibility(self):
-        is_raw = self.f4.currentIndex() != 0
-        for w in [self.x4, self.b_xmp4, self.lbl_x4]: w.setEnabled(is_raw)
+        # Vrije XMP altijd beschikbaar maken op verzoek
+        for w in [self.x4, self.b_xmp4, self.lbl_x4]: w.setEnabled(True)
     def closeEvent(self, event):
         if self.worker: self.worker.stop()
         CONFIG["LAST_SOURCE_DIR"], CONFIG["MAX_GAP"], CONFIG["SAME_GAP"], CONFIG["COPY_FIRST_TO_ROOT"] = self.s1.text(), self.gv.value(), self.gv_same.value(), self.cb_copy_first.isChecked()
@@ -621,6 +621,18 @@ class MainWindow(QMainWindow):
             w = PanoWorker(files, self.x4.text(), p_dir, ev_map); w.sub_progress.connect(self.p4_sub.setValue)
             w.result_path.connect(lambda p: setattr(self, 'last_pano_result', p)); w.finished.connect(self.lw.clearSelection); self._run(w, self.p4_sub, self.log4, self.b4, self.stop4)
     def open_dt(self):
+        # Controleer op actieve sessie of database lock
+        lock_file = os.path.expanduser("~/.config/darktable/library.db.lock")
+        is_running = False
+        try:
+            res = subprocess.run(['pgrep', '-x', 'darktable'], capture_output=True)
+            if res.returncode == 0: is_running = True
+        except: pass
+
+        if is_running or os.path.exists(lock_file):
+            QMessageBox.warning(self, "Darktable Bezet", "Darktable is nog actief of de database is geblokkeerd.\nSluit Darktable eerst af of verwijder de lock-file.")
+            return
+
         try:
             sel = self.lw.selectedItems(); target = sel[0].data(Qt.UserRole) if len(sel) == 1 else self.last_pano_result
             if target and os.path.exists(target): subprocess.Popen(['darktable', '--library', ':memory:', target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
