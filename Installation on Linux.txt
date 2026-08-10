@@ -1,0 +1,62 @@
+Here is an explanation regarding the compatibility and limitations of
+PanoStack across different operating systems.
+
+1. Why the "Package" is Arch-Specific (PKGBUILD)
+
+The reason you can only "install" the program easily on Arch Linux is the
+PKGBUILD file.
+
+  - Arch Build System: A PKGBUILD is a specific script for the Arch Linux tool
+    makepkg. It instructs the system how to download, compile, and place files
+    in specific system directories.
+  - Package Manager: It relies on pacman to handle dependencies. Other Linux
+    distributions (like Ubuntu, Fedora, or Debian) use different package formats
+    (.deb, .rpm) and different tools (apt, dnf), so they cannot read or execute
+    a PKGBUILD.
+
+2. Why the "Python Script" works on other Linux Distros
+
+The core file (Ontwikkel.py or panostack.py) is standard Python 3. It can run on
+any Linux distribution (Ubuntu, Mint, Manjaro, etc.), provided the following
+conditions are met:
+
+  - Python Dependencies: The user must manually install PySide6, opencv-python,
+    and numpy (usually via pip).
+  - System Dependencies: The external engines used by the script must be
+    installed and available in the system's "PATH" (the terminal must be able to
+    find them). These include:
+      - darktable & darktable-cli
+      - hugin & align_image_stack
+      - enblend-enfuse
+      - exiftool
+      - imagemagick
+      - hdrmerge
+
+If these tools are installed, the script will behave exactly as it does on Arch.
+
+3. Why Windows is extremely difficult
+
+While Python itself runs on Windows, PanoStack is currently written to "talk" to
+a Linux system. Porting it to Windows would require a major rewrite for three
+main reasons:
+
+  - Linux-Specific Shell Commands: The script uses commands like cp
+    --reflink=auto. Windows does not have a cp command (it uses copy or xcopy),
+    and it does not support the --reflink feature, which is unique to Linux file
+    systems like Btrfs or XFS. It also uses pgrep to check if Darktable is
+    running; Windows would require tasklist.
+  - External Tool Installation: On Linux, installing dependencies is a single
+    command (sudo pacman -S...). On Windows, a user would have to download and
+    install 6 different programs manually. Furthermore, most Windows installers
+    do not add the "command line" versions of these tools to the System PATH.
+    Without manual configuration of Environment Variables, PanoStack wouldn't be
+    able to "find" Darktable or Hugin.
+  - File Path Logic: PanoStack looks for configurations in ~/.config/ and lock
+    files in specific Linux directories. Windows uses a completely different
+    structure (e.g., %APPDATA%), meaning the script would get lost looking for
+    files that aren't there.
+
+Summary: The PKGBUILD makes it an Arch Linux "native" application. The Python
+script is a "Universal Linux" application. Windows support is currently blocked
+by fundamental differences in how the two operating systems handle commands and
+external software.
