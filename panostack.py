@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PanoStack (v3.5.1)
+PanoStack (v3.5.6)
 - INFO: FULL DETAILED COMPREHENSIVE USER MANUAL restored under the ⓘ button.
 - FIX: Panorama-tab hanging during mode switch resolved (Abort flag added to worker).
 - FIX: Thumbnail size 300 works correctly (dynamic ListWidget IconSize).
@@ -14,6 +14,8 @@ PanoStack (v3.5.1)
 - NEW: Enhanced logging for HDR, Burst and Panorama processes.
 - FIX: Free XMP field always enabled in Panorama tab.
 - FIX: Darktable lock-check to prevent crashes.
+- FIX: XMP path resolution for Arch Linux PKGBUILD (symlink awareness).
+- FIX: Large TIFF preview display for 3+ image panoramas (QImageReader memory fix).
 """
 
 import sys
@@ -27,7 +29,7 @@ import re
 import gc
 from datetime import datetime
 
-# --- PADEN VOOR PYINSTALLER (INPAKKEN) ---
+# --- PADEN VOOR PYINSTALLER EN SYSTEM INSTALLS ---
 if getattr(sys, 'frozen', False):
     SCRIPT_DIR = sys._MEIPASS
 else:
@@ -80,7 +82,7 @@ try:
         QSplitter, QSizePolicy, QCheckBox, QMenu
     )
     from PySide6.QtCore import QThread, QObject, Signal, Slot, Qt, QSize
-    from PySide6.QtGui import QIcon, QPixmap, QTransform, QImage, QColor, QBrush, QAction
+    from PySide6.QtGui import QIcon, QPixmap, QTransform, QImage, QColor, QBrush, QAction, QImageReader
     import cv2
     import numpy as np
 except ImportError as e:
@@ -118,21 +120,35 @@ def smart_copy(src, dst):
 def get_image_robust(path):
     if not path or not os.path.exists(path):
         return QImage()
-    img = QImage()
+
     ext = os.path.splitext(path)[1].lower()
+    img = QImage()
+
+    # Speciale afhandeling voor RAW previews
     if ext in ['.dng', '.rw2', '.arw', '.cr2', '.cr3', '.nef', '.orf', '.raf']:
         for tag in ['-PreviewImage', '-JpgFromRaw', '-ThumbnailImage']:
             res = subprocess.run(['exiftool', '-b', tag, path], capture_output=True)
             if res.stdout and len(res.stdout) > 5000:
                 img.loadFromData(res.stdout)
-                if not img.isNull():
-                    break
-        if img.isNull():
-            return QImage()
+                if not img.isNull(): break
+        if img.isNull(): return QImage()
+
+    # Gebruik QImageReader voor TIFF en JPG (voorkomt crashes bij zeer grote panorama's)
     else:
-        img.load(path)
+        reader = QImageReader(path)
+        reader.setAllocationLimit(0) # Sta grote bestanden toe
+        if reader.canRead():
+            # Als de afbeelding erg groot is, schaal hem dan tijdens het inladen om RAM te sparen
+            orig_size = reader.size()
+            if orig_size.width() > 5000 or orig_size.height() > 5000:
+                orig_size.scale(3000, 3000, Qt.KeepAspectRatio)
+                reader.setScaledSize(orig_size)
+            img = reader.read()
+
     if img.isNull():
         return QImage()
+
+    # Correcte oriëntatie via ExifTool
     try:
         out = subprocess.run(['exiftool', '-S3', '-Orientation', '-n', path], capture_output=True, text=True)
         orient = int(out.stdout.strip()) if out.stdout.strip() else 1
@@ -153,29 +169,28 @@ def get_capture_date_compact(path):
     except: pass
     return datetime.now().strftime("%Y%m%d")
 
-def find_best_xmp(folder_path):
-    check_path = folder_path
-    for _ in range(3):
-        local_xmps = glob.glob(os.path.join(check_path, "*.xmp"))
-        if local_xmps: return sorted(local_xmps, key=len)[0]
-        parent = os.path.dirname(check_path)
-        if parent == check_path: break
-        check_path = parent
-    global_xmp = os.path.join(SCRIPT_DIR, CONFIG["DT_XMP_FILE"])
-    return global_xmp if os.path.exists(global_xmp) else None
+def find_best_xmp():
+    """Zoekt robuust naar oppepper.xmp op basis van de werkelijke scriptlocatie."""
+    target_name = CONFIG["DT_XMP_FILE"]
+    path_script = os.path.join(SCRIPT_DIR, target_name)
+    if os.path.exists(path_script):
+        return path_script
+    path_arch = f"/usr/share/panostack/{target_name}"
+    if os.path.exists(path_arch):
+        return path_arch
+    return None
 
 def create_exposure_xmp(ev_value, base_xmp=None):
-    """Maakt een tijdelijk XMP bestand aan met de gewenste belichtingscorrectie,
-    gecombineerd met de bestaande geschiedenis van de basis-XMP."""
+    """Maakt een tijdelijk XMP bestand aan met de gewenste belichtingscorrectie."""
+    ev_map = { 1: "0000803f", 0: "00000000", -1: "000080bf", -2: "000000c0", -3: "000040c0" }
+    ev_hex = ev_map.get(ev_value, "00000000")
+    params = f"{ev_hex}00000000000000000000803f0000803f"
+
     tmp_xmp = tempfile.NamedTemporaryFile(suffix=".xmp", delete=False).name
-    # Mapping van EV naar Darktable Float Hex
-    ev_map = { 1: "0000803f", -1: "000080bf", -2: "000000c0", -3: "000040c0" }
-    ev_param = ev_map.get(ev_value, "00000000")
 
     if base_xmp and os.path.exists(base_xmp):
         try:
-            with open(base_xmp, 'r') as f:
-                content = f.read()
+            with open(base_xmp, 'r') as f: content = f.read()
             if "<darktable:history>" in content and "</rdf:Seq>" in content:
                 new_li = f"""     <rdf:li
       darktable:num="999"
@@ -183,7 +198,7 @@ def create_exposure_xmp(ev_value, base_xmp=None):
       darktable:operation="exposure"
       darktable:enabled="1"
       darktable:modversion="6"
-      darktable:params="0000000000000000{ev_param}0000803f0000803f"
+      darktable:params="{params}"
       darktable:multi_priority="0"
       darktable:multi_name=""
       darktable:iop_order="21.0000000000000"/>
@@ -201,7 +216,7 @@ def create_exposure_xmp(ev_value, base_xmp=None):
    <darktable:history>
     <rdf:Seq>
      <rdf:li darktable:num="0" darktable:module="exposure" darktable:operation="exposure" darktable:enabled="1" darktable:modversion="6"
-      darktable:params="0000000000000000{ev_param}0000803f0000803f" darktable:multi_priority="0" darktable:multi_name="" darktable:iop_order="21.0000000000000"/>
+      darktable:params="{params}" darktable:multi_priority="0" darktable:multi_name="" darktable:iop_order="21.0000000000000"/>
     </rdf:Seq>   </darktable:history>
   </rdf:Description>
  </rdf:RDF>
@@ -328,7 +343,7 @@ class HdrBurstWorker(BaseWorker):
 
             for i, path in enumerate(subdirs):
                 if not self._is_running: break
-                name, xmp = os.path.basename(path), find_best_xmp(path)
+                name, xmp = os.path.basename(path), find_best_xmp()
                 self.log.emit(f"<br><b>Actief:</b> {name}")
                 coll_dng, coll_tif = os.path.join(coll_root, "DNG", f"{name}_HDR.dng"), os.path.join(coll_root, "TIFF", f"{name}_HDR.tif")
 
@@ -370,23 +385,18 @@ class HdrBurstWorker(BaseWorker):
             ali = os.path.join(tmp_dir, "ali_")
             self.log.emit(f"     Uitlijnen van {len(tifs)} frames (align_image_stack)...")
             self.safe_run(['align_image_stack', '-m', '10', '-a', ali, '-c', '20', '-z', '-x', '-y'] + tifs)
-
             alis = sorted(glob.glob(os.path.join(tmp_dir, "ali_*.tif")))
             for a in alis: self.safe_run(['mogrify', '-alpha', 'off', '-type', 'truecolor', '+matte', a])
-
             out_h = os.path.join(tmp_dir, "result.tif")
             if self.mode == "BURST":
                 self.log.emit(f"     Median stacking (Noise Reduction)...")
                 self.safe_run(['convert'] + alis + ['-evaluate-sequence', 'median', out_h])
             else:
-                self.log.emit(f"     Enfuse blending (E:{self.weights[0]} S:{self.weights[1]} C:{self.weights[2]})...")
+                self.log.emit(f"     Enfuse blending...")
                 self.safe_run(['enfuse', f'--depth={self.bit_depth}', f'--exposure-weight={self.weights[0]}', '--output', out_h] + alis, env=ENV_STABLE)
-
             if os.path.exists(out_h):
                 final = os.path.join(path, f"{name}_HDR.tif")
-                if self.crop_percent > 0:
-                    self.log.emit(f"     Bijsnijden ({self.crop_percent}%)...")
-                    self.safe_run(['mogrify', '-shave', f'{self.crop_percent}%x{self.crop_percent}%', out_h])
+                if self.crop_percent > 0: self.safe_run(['mogrify', '-shave', f'{self.crop_percent}%x{self.crop_percent}%', out_h])
                 shutil.copy2(out_h, final); return final
         return None
 
@@ -406,27 +416,28 @@ class PanoWorker(BaseWorker):
                     if not self._is_running: break
                     ev = self.ev_map.get(f, 0)
                     fname = os.path.basename(f)
-
                     if f.lower().endswith(('.dng','.rw2','.arw','.cr2','.cr3','.nef','.orf','.raf')) or ev != 0:
-                        self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} " + (f" (EV: {ev:+})" if ev != 0 else ""))
+                        xmp_base = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp()
+                        if ev != 0:
+                            xmp_final = create_exposure_xmp(ev, xmp_base)
+                            self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} [EV: {ev:+} via tijdelijke XMP]")
+                        else:
+                            xmp_final = xmp_base
+                            if xmp_final: self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} [XMP: {os.path.basename(xmp_final)}]")
+                            else: self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} [Geen XMP gevonden!]")
                         t = os.path.join(tmp_dir, f"p_{i}.tif")
-                        xmp = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp(os.path.dirname(f))
-                        if ev != 0: xmp = create_exposure_xmp(ev, xmp)
                         cmd = ['darktable-cli', f]
-                        if xmp: cmd.append(xmp)
+                        if xmp_final: cmd.append(xmp_final)
                         cmd.extend([t, '--core', '--library', ':memory:', '--disable-opencl'])
                         self.safe_run(cmd); read_f = t
                     else:
-                        self.log.emit(f"  -> Laden: {fname}")
-                        read_f = f
-
+                        self.log.emit(f"  -> Laden: {fname}"); read_f = f
                     img = cv2.imread(read_f, cv2.IMREAD_UNCHANGED)
                     if img is not None:
                         if img.dtype == np.uint16: img = (img / 256).astype(np.uint8)
                         if img.shape[2] == 4: img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
                         imgs.append(img)
                     self.sub_progress.emit(int(((i + 1) / len(self.files)) * 80))
-
                 if len(imgs) > 1 and self._is_running:
                     self.log.emit(f"Stitching gestart (Engine: OpenCV)...")
                     st = cv2.Stitcher_create(cv2.Stitcher_PANORAMA)
@@ -436,17 +447,14 @@ class PanoWorker(BaseWorker):
                         st.setSeamFinder(cv2.detail_GraphCutSeamFinder('COST_COLOR'))
                         st.setWaveCorrection(True); st.setWaveCorrectKind(cv2.detail_WAVE_CORRECT_HORIZ)
                     except: pass
-
                     status, res = st.stitch(imgs)
                     if status == cv2.Stitcher_OK:
                         os.makedirs(self.output_dir, exist_ok=True)
                         fname_out = f"{os.path.splitext(os.path.basename(self.files[0]))[0]}_Pano.tif"
                         out = os.path.join(self.output_dir, fname_out)
                         cv2.imwrite(out, res)
-                        self.log.emit(f"<b style='color:#27ae60;'>✓ Panorama gereed:</b> {out}")
-                        self.result_path.emit(out)
-                    else:
-                        self.log.emit(f"<b style='color:#e74c3c;'>Fout: Stitching mislukt (OpenCV status: {status}).</b>")
+                        self.log.emit(f"<b style='color:#27ae60;'>✓ Panorama gereed:</b> {out}"); self.result_path.emit(out)
+                    else: self.log.emit(f"<b style='color:#e74c3c;'>Fout: Stitching mislukt.</b>")
                 self.progress.emit(100)
             except Exception as e: self.log.emit(f"Fout: {e}")
             finally: self.finished.emit()
@@ -468,62 +476,49 @@ class HuginCliWorker(BaseWorker):
                     ev = self.ev_map.get(f, 0)
                     fname = os.path.basename(f)
                     if f.lower().endswith(('.dng','.rw2','.arw','.cr2','.cr3','.nef', '.orf', '.raf')) or ev != 0:
-                        self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname}" + (f" [EV: {ev:+}]" if ev != 0 else ""))
+                        xmp_base = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp()
+                        if ev != 0:
+                            xmp_final = create_exposure_xmp(ev, xmp_base)
+                            self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} [EV: {ev:+} via tijdelijke XMP]")
+                        else:
+                            xmp_final = xmp_base
+                            if xmp_final: self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} [XMP: {os.path.basename(xmp_final)}]")
+                            else: self.log.emit(f"  -> Ontwikkelen ({i+1}/{len(self.files)}): {fname} [Geen XMP gevonden!]")
                         t = os.path.join(tmp, f"h_{i}.tif")
-                        xmp = self.custom_xmp if (self.custom_xmp and os.path.exists(self.custom_xmp)) else find_best_xmp(os.path.dirname(f))
-                        if ev != 0: xmp = create_exposure_xmp(ev, xmp)
                         cmd = ['darktable-cli', f]
-                        if xmp: cmd.append(xmp)
+                        if xmp_final: cmd.append(xmp_final)
                         cmd.extend([t, '--core', '--library', ':memory:', '--disable-opencl'])
                         self.safe_run(cmd); tiffs.append(t)
                     else:
-                        self.log.emit(f"  -> Kopieer (TIFF/JPG): {fname}")
-                        t = os.path.join(tmp, f"h_{i}{os.path.splitext(f)[1]}")
-                        shutil.copy2(f, t); tiffs.append(t)
+                        self.log.emit(f"  -> Kopieer: {fname}")
+                        t = os.path.join(tmp, f"h_{i}{os.path.splitext(f)[1]}"); shutil.copy2(f, t); tiffs.append(t)
                     self.sub_progress.emit(int(((i+1)/len(self.files))*20))
 
                 if not tiffs or not self._is_running: return
                 pto, prefix = os.path.join(tmp, "p.pto"), os.path.join(tmp, "out")
-
-                self.log.emit("Stap 1: PTO-project genereren (pto_gen)...")
-                self.safe_run(['pto_gen', '-o', pto] + tiffs)
-
-                self.log.emit("Stap 2: Controlepunten detecteren (cpfind)...")
-                self.safe_run(['cpfind', '--multirow', '--celeste', '-o', pto, pto])
-
-                self.log.emit("Stap 3: Controlepunten opschonen (cpclean)...")
-                self.safe_run(['cpclean', '-o', pto, pto])
-
+                self.log.emit("Stap 1: PTO-project genereren..."); self.safe_run(['pto_gen', '-o', pto] + tiffs)
+                self.log.emit("Stap 2: Controlepunten detecteren..."); self.safe_run(['cpfind', '--multirow', '--celeste', '-o', pto, pto])
+                self.log.emit("Stap 3: Controlepunten opschonen..."); self.safe_run(['cpclean', '-o', pto, pto])
                 lf = shutil.which("hugin_linefind") or shutil.which("linefind")
-                if lf:
-                    self.log.emit("Stap 4: Verticale lijnen zoeken (linefind)...")
-                    self.safe_run([lf, '-o', pto, pto])
-
-                self.log.emit("Stap 5: Optimaliseren (autooptimiser)...")
-                self.safe_run(['autooptimiser', '-a', '-m', '-p', '-s', '-l', '-o', pto, pto])
-
-                self.log.emit("Stap 6: Canvas instellen (pano_modify)...")
-                self.safe_run(['pano_modify', '--straighten', '--canvas=AUTO', '--crop=AUTO', '--center', '-o', pto, pto])
-
-                self.log.emit("Stap 7: Finale stitching (hugin_executor)... even geduld.")
-                self.safe_run(['hugin_executor', '--stitching', f'--prefix={prefix}', pto])
+                if lf: self.log.emit("Stap 4: Verticale lijnen zoeken..."); self.safe_run([lf, '-o', pto, pto])
+                self.log.emit("Stap 5: Optimaliseren..."); self.safe_run(['autooptimiser', '-a', '-m', '-p', '-s', '-l', '-o', pto, pto])
+                self.log.emit("Stap 6: Canvas instellen..."); self.safe_run(['pano_modify', '--straighten', '--canvas=AUTO', '--crop=AUTO', '--center', '-o', pto, pto])
+                self.log.emit("Stap 7: Finale stitching... even geduld."); self.safe_run(['hugin_executor', '--stitching', f'--prefix={prefix}', pto])
 
                 res = prefix + ".tif"
                 if os.path.exists(res):
                     os.makedirs(self.output_dir, exist_ok=True)
                     out = os.path.join(self.output_dir, f"Pano_Hugin_{get_capture_date_compact(self.files[0])}.tif")
                     shutil.move(res, out)
-                    self.log.emit(f"<b style='color:#27ae60;'>✓ Gereed:</b> {out}")
-                    self.result_path.emit(out)
-                else:
-                    self.log.emit(f"<b style='color:#e74c3c;'>Fout: Hugin-verwerking mislukt.</b>")
+                    self.log.emit(f"<b style='color:#27ae60;'>✓ Gereed:</b> {out}"); self.result_path.emit(out)
+                else: self.log.emit(f"<b style='color:#e74c3c;'>Fout: Hugin mislukt.</b>")
             except Exception as e: self.log.emit(f"Fout: {e}")
             finally: self.progress.emit(100); self.finished.emit()
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PanoStack v3.5.1")
+        self.setWindowTitle("PanoStack v3.5.6")
         self.resize(1300, 900)
         missing, deps = check_dependencies()
         if missing: QMessageBox.warning(self, "Readiness", f"Missing: {missing}")
@@ -607,7 +602,7 @@ class MainWindow(QMainWindow):
         elif action == a_m2: item.setData(Qt.UserRole + 1, -2); item.setText(f"{os.path.basename(path)} [-2 EV]"); item.setBackground(QBrush(QColor(255, 200, 200)))
         elif action == a_m3: item.setData(Qt.UserRole + 1, -3); item.setText(f"{os.path.basename(path)} [-3 EV]"); item.setBackground(QBrush(QColor(255, 150, 150)))
     def show_readme(self):
-        text = """<h2 style='color:#2980b9;'>PanoStack v3.5.1 - User Manual</h2>
+        text = """<h2 style='color:#2980b9;'>PanoStack v3.5.6 - User Manual</h2>
         <p><b>PanoStack</b> is an automated high-performance HQ RAW workflow utility for professional photographers.</p>
 
         <h3 style='color:#2c3e50;'>1. Sorting Tab (The Foundation)</h3>
@@ -649,7 +644,6 @@ class MainWindow(QMainWindow):
         is_enf = self.m2.currentText() != "HDRmerge (DNG)"
         for w in [self.ew2, self.sw2, self.cw2, self.cp2]: w.setEnabled(is_enf)
     def update_pano_xmp_visibility(self):
-        # Vrije XMP permanent vrijgegeven in v3.5.1
         for w in [self.x4, self.b_xmp4, self.lbl_x4]: w.setEnabled(True)
     def closeEvent(self, event):
         if self.worker: self.worker.stop()
@@ -692,18 +686,15 @@ class MainWindow(QMainWindow):
             w = PanoWorker(files, self.x4.text(), p_dir, ev_map); w.sub_progress.connect(self.p4_sub.setValue)
             w.result_path.connect(lambda p: setattr(self, 'last_pano_result', p)); w.finished.connect(self.lw.clearSelection); self._run(w, self.p4_sub, self.log4, self.b4, self.stop4)
     def open_dt(self):
-        # Darktable lock-check
         lock_file = os.path.expanduser("~/.config/darktable/library.db.lock")
         is_running = False
         try:
             res = subprocess.run(['pgrep', '-x', 'darktable'], capture_output=True)
             if res.returncode == 0: is_running = True
         except: pass
-
         if is_running or os.path.exists(lock_file):
             QMessageBox.warning(self, "Darktable Bezet", "Darktable is nog actief of de database is geblokkeerd.\nSluit Darktable eerst af of verwijder de lock-file.")
             return
-
         try:
             sel = self.lw.selectedItems(); target = sel[0].data(Qt.UserRole) if len(sel) == 1 else self.last_pano_result
             if target and os.path.exists(target): subprocess.Popen(['darktable', '--library', ':memory:', target], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -717,14 +708,12 @@ class MainWindow(QMainWindow):
             os.makedirs(tmp_h, exist_ok=True); self.active_temp_dirs.append(tmp_h); final_p = []
             for i, f in enumerate(files):
                 ev = ev_map.get(f, 0)
-                if f.lower().endswith(('.dng','.rw2','.arw','.cr2','.cr3','.nef', '.orf', '.raf')) or ev != 0:
-                    tif, xmp = os.path.join(tmp_h, f"h_{i}.tif"), (self.x4.text() or find_best_xmp(os.path.dirname(f)))
-                    if ev != 0: xmp = create_exposure_xmp(ev, xmp)
-                    cmd = ['darktable-cli', f];
-                    if xmp: cmd.append(xmp)
-                    cmd.extend([tif, '--core', '--library', ':memory:', '--disable-opencl'])
-                    subprocess.run(cmd, stdout=subprocess.DEVNULL); final_p.append(tif)
-                else: final_p.append(os.path.abspath(f))
+                tif, xmp = os.path.join(tmp_h, f"h_{i}.tif"), (self.x4.text() or find_best_xmp())
+                if ev != 0: xmp = create_exposure_xmp(ev, xmp)
+                cmd = ['darktable-cli', f]
+                if xmp: cmd.append(xmp)
+                cmd.extend([tif, '--core', '--library', ':memory:', '--disable-opencl'])
+                subprocess.run(cmd, stdout=subprocess.DEVNULL); final_p.append(tif)
             if final_p: subprocess.Popen(['hugin'] + final_p)
         else:
             self.log4.clear(); p_dir = self._get_pano_save_dir(files[0])
@@ -783,8 +772,7 @@ class ThumbnailWorker(QObject):
                         if os.path.basename(r).startswith(("Serie_", "Reeks_", "Burst_")):
                             v_fs = sorted([f for f in fs if f.lower().endswith(self.extensions)])
                             if v_fs:
-                                p = os.path.join(r, v_fs[0])
-                                if p not in found: fps.append(p); found.add(p)
+                                p = os.path.join(r, v_fs[0]); found.add(p); fps.append(p)
         for i, fp in enumerate(fps):
             if self.is_aborted: break
             img = get_image_robust(fp)
