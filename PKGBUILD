@@ -1,5 +1,5 @@
 pkgname=panostack
-pkgver=3.6.0
+pkgver=3.5.7
 pkgrel=1
 pkgdesc="Professional Panorama and HDR stacking utility."
 arch=('any')
